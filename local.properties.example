@@ -1,0 +1,3 @@
+# Copy this file to local.properties and keep the real key private.
+# Android Studio may add sdk.dir automatically.
+AMAP_API_KEY=replace_with_your_android_amap_key
