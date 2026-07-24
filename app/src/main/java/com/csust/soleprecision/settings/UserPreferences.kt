@@ -37,8 +37,8 @@ class UserPreferencesStore(context: Context) {
             preferences.getString(KEY_GUIDANCE_MODE, null),
             GuidanceMode.HAPTIC_AND_SPEECH,
         ),
-        vibrationStrength = preferences.getInt(KEY_VIBRATION_STRENGTH, 70),
-        speakerVolume = preferences.getInt(KEY_SPEAKER_VOLUME, 70),
+        vibrationStrength = preferences.getInt(KEY_VIBRATION_STRENGTH, 70).coerceIn(20, 100),
+        speakerVolume = preferences.getInt(KEY_SPEAKER_VOLUME, 70).coerceIn(0, 100),
         speechDetail = enumValueOrDefault(
             preferences.getString(KEY_SPEECH_DETAIL, null),
             SpeechDetail.STANDARD,
@@ -53,8 +53,8 @@ class UserPreferencesStore(context: Context) {
     fun save(value: UserPreferences) {
         preferences.edit()
             .putString(KEY_GUIDANCE_MODE, value.guidanceMode.name)
-            .putInt(KEY_VIBRATION_STRENGTH, value.vibrationStrength)
-            .putInt(KEY_SPEAKER_VOLUME, value.speakerVolume)
+            .putInt(KEY_VIBRATION_STRENGTH, value.vibrationStrength.coerceIn(20, 100))
+            .putInt(KEY_SPEAKER_VOLUME, value.speakerVolume.coerceIn(0, 100))
             .putString(KEY_SPEECH_DETAIL, value.speechDetail.name)
             .putString(KEY_LANGUAGE, value.language.name)
             .putBoolean(KEY_EXTRA_PROMPTS, value.extraSpokenPrompts)

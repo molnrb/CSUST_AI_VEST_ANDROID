@@ -7,9 +7,37 @@ data class PlaceCandidate(
     val area: String,
     val latitude: Double,
     val longitude: Double,
+    val typeDescription: String = "",
+    val entranceLatitude: Double? = null,
+    val entranceLongitude: Double? = null,
+    val exitLatitude: Double? = null,
+    val exitLongitude: Double? = null,
+    val indoorFloorName: String = "",
+    val businessTags: String = "",
+    val childPlaceNames: List<String> = emptyList(),
 ) {
+    val navigationLatitude: Double
+        get() = entranceLatitude ?: latitude
+
+    val navigationLongitude: Double
+        get() = entranceLongitude ?: longitude
+
+    val hasMappedEntrance: Boolean
+        get() = entranceLatitude != null && entranceLongitude != null
+
+    val accessibilityDetails: String
+        get() = buildList {
+            if (typeDescription.isNotBlank()) add(typeDescription)
+            if (hasMappedEntrance) add("AMap entrance available")
+            if (indoorFloorName.isNotBlank()) add("Floor $indoorFloorName")
+            if (businessTags.isNotBlank()) add(businessTags)
+            if (childPlaceNames.isNotEmpty()) {
+                add("Includes ${childPlaceNames.take(3).joinToString()}")
+            }
+        }.distinct().joinToString(". ")
+
     val spokenDescription: String
-        get() = listOf(name, address, area)
+        get() = listOf(name, address, area, accessibilityDetails)
             .filter(String::isNotBlank)
             .distinct()
             .joinToString(", ")

@@ -2,6 +2,7 @@ package com.csust.soleprecision.navigation
 
 import android.content.Context
 import com.amap.api.services.core.AMapException
+import com.amap.api.services.core.LatLonPoint
 import com.amap.api.services.core.PoiItemV2
 import com.amap.api.services.core.ServiceSettings
 import com.amap.api.services.poisearch.PoiResultV2
@@ -10,22 +11,32 @@ import com.amap.api.services.poisearch.VisualSearchResult
 
 class AmapPlaceSearchController(
     context: Context,
-) : PoiSearchV2.OnPoiSearchListener {
+) {
     private val appContext = context.applicationContext
-    private var callback: ((Result<List<PlaceCandidate>>) -> Unit)? = null
-    private var itemCallback: ((Result<PlaceCandidate>) -> Unit)? = null
     private var activeSearch: PoiSearchV2? = null
+    private var requestSerial = 0
 
     fun initializeAfterConsent() {
         ServiceSettings.updatePrivacyShow(appContext, true, true)
         ServiceSettings.updatePrivacyAgree(appContext, true)
     }
 
+    fun setLanguage(languageTag: String) {
+        ServiceSettings.getInstance().language =
+            if (languageTag.startsWith("en", ignoreCase = true)) {
+                ServiceSettings.ENGLISH
+            } else {
+                ServiceSettings.CHINESE
+            }
+    }
+
     fun search(
         keyword: String,
         cityCode: String?,
+        currentLocation: UserLocation? = null,
         onResult: (Result<List<PlaceCandidate>>) -> Unit,
     ) {
+        val serial = ++requestSerial
         val cleanKeyword = keyword.trim()
         if (cleanKeyword.isBlank()) {
             onResult(Result.failure(IllegalArgumentException("Say or enter a destination first")))
@@ -40,15 +51,41 @@ class AmapPlaceSearchController(
             }.apply {
                 pageSize = 5
                 pageNum = 1
+                cityLimit = !cityCode.isNullOrBlank()
+                showFields = PoiSearchV2.ShowFields(PoiSearchV2.ShowFields.ALL)
+                currentLocation?.let {
+                    location = LatLonPoint(it.latitude, it.longitude)
+                    isDistanceSort = true
+                }
             }
-            callback = onResult
             activeSearch = PoiSearchV2(appContext, query).also {
-                it.setOnPoiSearchListener(this)
+                it.setOnPoiSearchListener(
+                    requestListener(
+                        onPois = { result, errorCode ->
+                            if (serial != requestSerial) return@requestListener
+                            activeSearch = null
+                            if (errorCode != AMapException.CODE_AMAP_SUCCESS) {
+                                onResult(
+                                    Result.failure(
+                                        IllegalStateException(
+                                            "AMap place search failed ($errorCode)",
+                                        ),
+                                    ),
+                                )
+                                return@requestListener
+                            }
+                            val places = result
+                                ?.pois
+                                .orEmpty()
+                                .mapNotNull(::toCandidate)
+                            onResult(Result.success(places))
+                        },
+                    ),
+                )
                 it.searchPOIAsyn()
             }
         } catch (error: AMapException) {
-            callback = null
-            onResult(Result.failure(error))
+            if (serial == requestSerial) onResult(Result.failure(error))
         }
     }
 
@@ -56,59 +93,74 @@ class AmapPlaceSearchController(
         poiId: String,
         onResult: (Result<PlaceCandidate>) -> Unit,
     ) {
+        val serial = ++requestSerial
         if (poiId.isBlank()) {
             onResult(Result.failure(IllegalArgumentException("AMap suggestion has no POI ID")))
             return
         }
         try {
-            itemCallback = onResult
             activeSearch = PoiSearchV2(appContext, null).also {
-                it.setOnPoiSearchListener(this)
+                it.setOnPoiSearchListener(
+                    requestListener(
+                        onItem = { item, errorCode ->
+                            if (serial != requestSerial) return@requestListener
+                            activeSearch = null
+                            if (errorCode != AMapException.CODE_AMAP_SUCCESS || item == null) {
+                                onResult(
+                                    Result.failure(
+                                        IllegalStateException(
+                                            "AMap POI detail search failed ($errorCode)",
+                                        ),
+                                    ),
+                                )
+                                return@requestListener
+                            }
+                            val candidate = toCandidate(item)
+                            if (candidate == null) {
+                                onResult(
+                                    Result.failure(
+                                        IllegalStateException("AMap POI has no coordinates"),
+                                    ),
+                                )
+                            } else {
+                                onResult(Result.success(candidate))
+                            }
+                        },
+                    ),
+                )
                 it.searchPOIIdAsyn(poiId)
             }
         } catch (error: AMapException) {
-            itemCallback = null
-            onResult(Result.failure(error))
+            if (serial == requestSerial) onResult(Result.failure(error))
         }
     }
 
-    override fun onPoiSearched(result: PoiResultV2?, errorCode: Int) {
-        val pendingCallback = callback ?: return
-        callback = null
-
-        if (errorCode != AMapException.CODE_AMAP_SUCCESS) {
-            pendingCallback(Result.failure(IllegalStateException("AMap place search failed ($errorCode)")))
-            return
-        }
-
-        val places = result
-            ?.pois
-            .orEmpty()
-            .mapNotNull(::toCandidate)
-        pendingCallback(Result.success(places))
+    fun cancel() {
+        requestSerial += 1
+        activeSearch = null
     }
 
-    override fun onPoiItemSearched(item: PoiItemV2?, errorCode: Int) {
-        val pendingCallback = itemCallback ?: return
-        itemCallback = null
-        if (errorCode != AMapException.CODE_AMAP_SUCCESS || item == null) {
-            pendingCallback(
-                Result.failure(IllegalStateException("AMap POI detail search failed ($errorCode)")),
-            )
-            return
+    private fun requestListener(
+        onPois: (PoiResultV2?, Int) -> Unit = { _, _ -> },
+        onItem: (PoiItemV2?, Int) -> Unit = { _, _ -> },
+    ): PoiSearchV2.OnPoiSearchListener = object : PoiSearchV2.OnPoiSearchListener {
+        override fun onPoiSearched(result: PoiResultV2?, errorCode: Int) {
+            onPois(result, errorCode)
         }
-        val candidate = toCandidate(item)
-        if (candidate == null) {
-            pendingCallback(Result.failure(IllegalStateException("AMap POI has no coordinates")))
-        } else {
-            pendingCallback(Result.success(candidate))
-        }
-    }
 
-    override fun onVisualSearched(result: VisualSearchResult?, errorCode: Int) = Unit
+        override fun onPoiItemSearched(item: PoiItemV2?, errorCode: Int) {
+            onItem(item, errorCode)
+        }
+
+        override fun onVisualSearched(result: VisualSearchResult?, errorCode: Int) = Unit
+    }
 
     private fun toCandidate(item: PoiItemV2): PlaceCandidate? {
         val point = item.latLonPoint ?: return null
+        val entrance = item.poiNavi?.enter
+        val exit = item.poiNavi?.exit
+        val indoor = item.indoorData
+        val business = item.business
         return PlaceCandidate(
             id = item.poiId.orEmpty(),
             name = item.title.orEmpty().ifBlank { "Unnamed place" },
@@ -119,6 +171,22 @@ class AmapPlaceSearchController(
                 .joinToString(", "),
             latitude = point.latitude,
             longitude = point.longitude,
+            typeDescription = item.typeDes.orEmpty(),
+            entranceLatitude = entrance?.latitude,
+            entranceLongitude = entrance?.longitude,
+            exitLatitude = exit?.latitude,
+            exitLongitude = exit?.longitude,
+            indoorFloorName = indoor?.floorName.orEmpty(),
+            businessTags = listOf(
+                business?.tag.orEmpty(),
+                business?.alias.orEmpty(),
+            ).filter(String::isNotBlank).distinct().joinToString(", "),
+            childPlaceNames = item.subPois
+                .orEmpty()
+                .map { it.title.orEmpty() }
+                .filter(String::isNotBlank)
+                .distinct()
+                .take(5),
         )
     }
 }

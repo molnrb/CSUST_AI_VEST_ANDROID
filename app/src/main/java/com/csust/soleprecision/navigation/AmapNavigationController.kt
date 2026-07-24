@@ -7,6 +7,8 @@ import com.amap.api.navi.SimpleNaviListener
 import com.amap.api.navi.enums.NaviType
 import com.amap.api.navi.enums.TravelStrategy
 import com.amap.api.navi.model.AMapCalcRouteResult
+import com.amap.api.navi.model.AMapNaviLocation
+import com.amap.api.navi.model.AMapNaviPath
 import com.amap.api.navi.model.NaviInfo
 import com.amap.api.navi.model.NaviLatLng
 import com.amap.api.navi.model.NaviPoi
@@ -17,6 +19,7 @@ class AmapNavigationController(
     private val onInstruction: (NavigationInstruction) -> Unit,
     private val onStatus: (String) -> Unit,
     private val onRouteReady: (RouteSummary) -> Unit = {},
+    private val onRoutesReady: (List<RouteSummary>) -> Unit = {},
 ) : AutoCloseable {
     private val appContext = context.applicationContext
     private var amapNavi: AMapNavi? = null
@@ -24,7 +27,11 @@ class AmapNavigationController(
     private var pendingNaviType: Int = NaviType.GPS
     private var startWhenRouteReady = true
     private var activeWalkingSteps: List<WalkingRouteStep> = emptyList()
+    private var availableRoutes: List<RouteSummary> = emptyList()
+    private var latestNaviLocation: AMapNaviLocation? = null
+    private var routeCompletionHandled = false
 
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     private val listener = object : SimpleNaviListener() {
         override fun onInitNaviSuccess() {
             onStatus("AMap navigation ready")
@@ -45,36 +52,38 @@ class AmapNavigationController(
         }
 
         override fun onCalculateRouteSuccess(routeResult: AMapCalcRouteResult?) {
-            val path = amapNavi?.naviPath
-            if (path != null) {
-                val walkingSteps = path.steps
-                    .orEmpty()
-                    .map { step ->
-                        val roadName = step.links
-                            .orEmpty()
-                            .asSequence()
-                            .map { it.roadName.orEmpty().trim() }
-                            .firstOrNull(String::isNotBlank)
-                            .orEmpty()
-                        WalkingRouteStep(
-                            maneuver = AmapManeuverMapper.fromIconType(step.iconType),
-                            distanceMeters = step.length.coerceAtLeast(0),
-                            durationSeconds = step.time.coerceAtLeast(0),
-                            roadName = roadName,
-                            mappedTrafficLightCount =
-                                step.trafficLightNumber.coerceAtLeast(0),
-                        )
-                    }
-                activeWalkingSteps = walkingSteps
-                onRouteReady(
-                    RouteSummary(
-                        distanceMeters = path.allLength,
-                        durationSeconds = path.allTime,
-                        steps = walkingSteps,
-                        mappedTrafficLightCount = path.trafficLightCount.coerceAtLeast(0),
-                    ),
-                )
+            handleSuccessfulRoutes()
+        }
+
+        override fun onCalculateRouteSuccess(routeIds: IntArray?) {
+            handleSuccessfulRoutes()
+        }
+
+        private fun handleSuccessfulRoutes() {
+            if (routeCompletionHandled) return
+            routeCompletionHandled = true
+            val navi = amapNavi
+            val paths = navi
+                ?.naviPaths
+                .orEmpty()
+                .entries
+                .sortedBy { it.key }
+                .map { (routeId, path) -> routeId to path }
+                .ifEmpty {
+                    navi?.naviPath?.let { listOf(0 to it) }.orEmpty()
+                }
+            if (paths.isEmpty()) {
+                availableRoutes = emptyList()
+                activeWalkingSteps = emptyList()
+                onRoutesReady(emptyList())
+                onStatus("AMap returned no usable walking route")
+                return
             }
+            availableRoutes = paths.map { (routeId, path) ->
+                path.toRouteSummary(routeId)
+            }
+            onRoutesReady(availableRoutes)
+            availableRoutes.firstOrNull()?.let(::activateRouteSummary)
 
             val mode = if (pendingNaviType == NaviType.EMULATOR) "Simulated" else "GPS"
             if (startWhenRouteReady) {
@@ -84,7 +93,15 @@ class AmapNavigationController(
             }
         }
 
+        override fun onCalculateRouteFailure(errorCode: Int) {
+            if (routeCompletionHandled) return
+            routeCompletionHandled = true
+            onStatus("AMap could not calculate that walking route ($errorCode)")
+        }
+
         override fun onCalculateRouteFailure(routeResult: AMapCalcRouteResult?) {
+            if (routeCompletionHandled) return
+            routeCompletionHandled = true
             val detail = routeResult?.errorDetail.orEmpty()
             onStatus(
                 if (detail.isBlank()) {
@@ -96,6 +113,8 @@ class AmapNavigationController(
         }
 
         override fun onReCalculateRouteForYaw() {
+            routeCompletionHandled = false
+            lastInstructionKey = null
             onStatus("Off route; AMap is calculating new walking guidance")
         }
 
@@ -113,12 +132,34 @@ class AmapNavigationController(
             )
         }
 
+        override fun onLocationChange(location: AMapNaviLocation?) {
+            latestNaviLocation = location
+        }
+
         override fun onNaviInfoUpdate(naviInfo: NaviInfo?) {
             naviInfo ?: return
             val maneuver = AmapManeuverMapper.fromIconType(naviInfo.iconType)
-            val distance = naviInfo.curStepRetainDistance.coerceAtLeast(0)
             val road = naviInfo.nextRoadName.orEmpty()
-            val mappedStep = activeWalkingSteps.getOrNull(naviInfo.curStep)
+            val liveLocation = latestNaviLocation
+            val stepIndex = liveLocation
+                ?.curStepIndex
+                ?.takeIf { it in activeWalkingSteps.indices }
+                ?: naviInfo.curStep
+            val mappedStep = activeWalkingSteps.getOrNull(stepIndex)
+            val distance = if (
+                liveLocation?.coord != null &&
+                mappedStep?.coordinates?.size?.let { it >= 2 } == true
+            ) {
+                RouteGeometry.remainingDistanceMeters(
+                    current = RouteCoordinate(
+                        liveLocation.coord.latitude,
+                        liveLocation.coord.longitude,
+                    ),
+                    stepPoints = mappedStep.coordinates,
+                )
+            } else {
+                mappedStep?.distanceMeters ?: 0
+            }
             val message = buildString {
                 append(maneuver.spokenLabel)
                 if (distance > 0) append(" in $distance metres")
@@ -129,8 +170,11 @@ class AmapNavigationController(
                 ) {
                     append(". AMap shows a traffic light on this step")
                 }
-                if (maneuver == Maneuver.CROSSWALK) {
-                    append(". Confirm the real crossing and traffic state before entering")
+                if (mappedStep?.needsEnvironmentalConfirmation == true) {
+                    append(". Confirm the real surroundings before continuing")
+                }
+                if (liveLocation?.isMatchNaviPath == false) {
+                    append(". Position is not matched to the mapped route")
                 }
             }
 
@@ -229,6 +273,9 @@ class AmapNavigationController(
 
         lastInstructionKey = null
         activeWalkingSteps = emptyList()
+        availableRoutes = emptyList()
+        latestNaviLocation = null
+        routeCompletionHandled = false
         pendingNaviType = if (simulateMovement) NaviType.EMULATOR else NaviType.GPS
         onStatus("Calculating walking route…")
         val accepted = if (destination != null) {
@@ -240,10 +287,10 @@ class AmapNavigationController(
                 ),
                 NaviPoi(
                     destination.name,
-                    LatLng(destination.latitude, destination.longitude),
+                    LatLng(destination.navigationLatitude, destination.navigationLongitude),
                     destination.id,
                 ),
-                TravelStrategy.SINGLE,
+                TravelStrategy.MULTIPLE,
             )
         } else {
             navi.calculateWalkRoute(
@@ -252,6 +299,7 @@ class AmapNavigationController(
             )
         }
         if (!accepted) {
+            routeCompletionHandled = true
             onStatus("AMap rejected the route request")
         }
     }
@@ -269,6 +317,16 @@ class AmapNavigationController(
         return started
     }
 
+    fun selectRoute(routeId: Int): Boolean {
+        val route = availableRoutes.firstOrNull { it.routeId == routeId } ?: return false
+        val accepted = routeId == 0 || amapNavi?.selectRouteId(routeId) == true
+        if (accepted) {
+            activateRouteSummary(route)
+            onStatus("Selected walking route ${availableRoutes.indexOf(route) + 1}")
+        }
+        return accepted
+    }
+
     fun repeatCurrentInstruction(): Boolean =
         amapNavi?.readNaviInfo() == true
 
@@ -279,7 +337,59 @@ class AmapNavigationController(
     fun stop() {
         amapNavi?.stopNavi()
         activeWalkingSteps = emptyList()
+        availableRoutes = emptyList()
+        latestNaviLocation = null
         onStatus("Navigation stopped")
+    }
+
+    private fun activateRouteSummary(route: RouteSummary) {
+        activeWalkingSteps = route.steps
+        onRouteReady(route)
+    }
+
+    private fun AMapNaviPath.toRouteSummary(routeId: Int): RouteSummary {
+        val rawSteps = steps.orEmpty().map { step ->
+            val coordinates = step.coords.orEmpty().map {
+                RouteCoordinate(it.latitude, it.longitude)
+            }
+            val roadName = step.links
+                .orEmpty()
+                .asSequence()
+                .map { it.roadName.orEmpty().trim() }
+                .firstOrNull(String::isNotBlank)
+                .orEmpty()
+            WalkingRouteStep(
+                maneuver = AmapManeuverMapper.fromIconType(step.iconType),
+                distanceMeters = step.length.coerceAtLeast(0),
+                durationSeconds = step.time.coerceAtLeast(0),
+                roadName = roadName,
+                mappedTrafficLightCount = step.trafficLightNumber.coerceAtLeast(0),
+                orientation = RouteGeometry.compassDirection(coordinates),
+                coordinates = coordinates,
+            )
+        }
+        val walkingSteps = rawSteps.mapIndexed { index, step ->
+            step.copy(
+                turnAngleDegrees = if (index == 0) {
+                    null
+                } else {
+                    RouteGeometry.turnAngleDegrees(rawSteps[index - 1].coordinates, step.coordinates)
+                },
+            )
+        }
+        val coordinates = coordList.orEmpty().map {
+            RouteCoordinate(it.latitude, it.longitude)
+        }
+        return RouteSummary(
+            distanceMeters = allLength.coerceAtLeast(0),
+            durationSeconds = allTime.coerceAtLeast(0),
+            steps = walkingSteps,
+            mappedTrafficLightCount = trafficLightCount.coerceAtLeast(0),
+            routeId = routeId,
+            routeLabel = labels.orEmpty(),
+            initialDirection = RouteGeometry.compassDirection(coordinates),
+            pathCoordinates = coordinates,
+        )
     }
 
     override fun close() {

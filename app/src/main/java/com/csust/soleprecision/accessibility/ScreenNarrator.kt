@@ -14,15 +14,23 @@ class ScreenNarrator(
     private val textToSpeech = TextToSpeech(appContext, this)
     private var isReady = false
     private var pendingMessage: String? = null
+    private var requestedLocale: Locale = Locale.ENGLISH
 
     override fun onInit(status: Int) {
         isReady = status == TextToSpeech.SUCCESS
         if (!isReady) return
 
-        textToSpeech.language = Locale.ENGLISH
+        textToSpeech.language = requestedLocale
         pendingMessage?.let {
             pendingMessage = null
             speak(it)
+        }
+    }
+
+    fun setLanguage(languageTag: String) {
+        requestedLocale = Locale.forLanguageTag(languageTag)
+        if (isReady) {
+            textToSpeech.language = requestedLocale
         }
     }
 

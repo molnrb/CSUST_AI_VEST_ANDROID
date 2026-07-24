@@ -59,6 +59,7 @@ class MainActivity : ComponentActivity() {
     )
     private var destinationSuggestions by mutableStateOf<List<DestinationSuggestion>>(emptyList())
     private var routeSummary by mutableStateOf<RouteSummary?>(null)
+    private var routeOptions by mutableStateOf<List<RouteSummary>>(emptyList())
     private var recentDestinations by mutableStateOf<List<PlaceCandidate>>(emptyList())
     private var userPreferences by mutableStateOf(UserPreferences())
     private var useMockHardware by mutableStateOf(false)
@@ -99,6 +100,7 @@ class MainActivity : ComponentActivity() {
         userPreferencesStore = UserPreferencesStore(this)
         userPreferences = userPreferencesStore.load()
         screenNarrator = ScreenNarrator(this)
+        screenNarrator.setLanguage(userPreferences.language.languageTag)
         useMockHardware = getPreferences(MODE_PRIVATE).getBoolean(
             MOCK_HARDWARE_KEY,
             isProbablyEmulator(),
@@ -123,6 +125,7 @@ class MainActivity : ComponentActivity() {
             onInstruction = ::handleInstruction,
             onStatus = { navigationStatus = it },
             onRouteReady = { routeSummary = it },
+            onRoutesReady = { routeOptions = it },
         )
         locationController = AmapLocationController(
             context = this,
@@ -152,6 +155,7 @@ class MainActivity : ComponentActivity() {
                 destinationSearchState = destinationSearchState,
                 destinationSuggestions = destinationSuggestions,
                 routeSummary = routeSummary,
+                routeOptions = routeOptions,
                 recentDestinations = recentDestinations,
                 userPreferences = userPreferences,
                 useMockHardware = useMockHardware,
@@ -169,11 +173,9 @@ class MainActivity : ComponentActivity() {
                 onSearchDestination = ::searchDestination,
                 onRequestDestinationSuggestions = ::requestDestinationSuggestions,
                 onSelectDestinationSuggestion = ::selectDestinationSuggestion,
-                onClearDestinationSearch = {
-                    destinationSearchState = DestinationSearchState.Idle
-                    destinationSuggestions = emptyList()
-                },
+                onClearDestinationSearch = ::clearDestinationSearch,
                 onPlanRoute = ::planRoute,
+                onSelectRoute = ::selectRoute,
                 onStartPlannedRoute = ::startPlannedRoute,
                 onRepeatInstruction = ::repeatCurrentInstruction,
                 onPauseGuidance = ::pauseGuidance,
@@ -189,6 +191,7 @@ class MainActivity : ComponentActivity() {
         navigationStatus = "Initializing AMap…"
         navigationController.initializeAfterConsent()
         placeSearchController.initializeAfterConsent()
+        placeSearchController.setLanguage(userPreferences.language.languageTag)
         inputTipsController.initializeAfterConsent()
         navigationController.setVoiceEnabled(userPreferences.guidanceMode != GuidanceMode.HAPTIC_ONLY)
         if (useMockHardware) {
@@ -228,6 +231,10 @@ class MainActivity : ComponentActivity() {
         ) == PackageManager.PERMISSION_GRANTED
 
     private fun startVoiceDestination() {
+        placeSearchController.cancel()
+        inputTipsController.cancel()
+        destinationSuggestions = emptyList()
+        speechRecognizer?.cancel()
         playListeningTone()
         if (useMockHardware) {
             destinationSearchState = DestinationSearchState.Listening
@@ -294,6 +301,7 @@ class MainActivity : ComponentActivity() {
                     override fun onEndOfSpeech() = Unit
 
                     override fun onError(error: Int) {
+                        if (destinationSearchState != DestinationSearchState.Listening) return
                         destinationSearchState = DestinationSearchState.Error(
                             when (error) {
                                 SpeechRecognizer.ERROR_NO_MATCH,
@@ -310,6 +318,7 @@ class MainActivity : ComponentActivity() {
                     }
 
                     override fun onResults(results: Bundle?) {
+                        if (destinationSearchState != DestinationSearchState.Listening) return
                         val spokenText = results
                             ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                             ?.firstOrNull()
@@ -327,6 +336,14 @@ class MainActivity : ComponentActivity() {
                 },
             )
         }
+    }
+
+    private fun clearDestinationSearch() {
+        speechRecognizer?.cancel()
+        placeSearchController.cancel()
+        inputTipsController.cancel()
+        destinationSearchState = DestinationSearchState.Idle
+        destinationSuggestions = emptyList()
     }
 
     private fun playListeningTone() {
@@ -349,6 +366,7 @@ class MainActivity : ComponentActivity() {
         placeSearchController.search(
             keyword = cleanQuery,
             cityCode = currentLocation?.cityCode,
+            currentLocation = currentLocation,
         ) { result ->
             result.onSuccess { places ->
                 destinationSearchState = DestinationSearchState.Results(cleanQuery, places)
@@ -395,6 +413,7 @@ class MainActivity : ComponentActivity() {
         activeDestination = destination
         pendingRouteDestination = destination
         routeSummary = null
+        routeOptions = emptyList()
         currentInstruction = null
         if (useMockHardware) {
             pendingRouteDestination = null
@@ -442,10 +461,20 @@ class MainActivity : ComponentActivity() {
         return started
     }
 
+    private fun selectRoute(routeId: Int): Boolean {
+        if (useMockHardware) {
+            val selected = routeOptions.firstOrNull { it.routeId == routeId } ?: return false
+            routeSummary = selected
+            return true
+        }
+        return navigationController.selectRoute(routeId)
+    }
+
     private fun pauseGuidance() {
         guidancePaused = true
         navigationController.setVoiceEnabled(false)
-        navigationStatus = "Phone route guidance paused; local obstacle detection remains active"
+        navigationStatus =
+            "Phone route guidance paused; the current app does not verify nearby obstacles"
     }
 
     private fun resumeGuidance() {
@@ -460,6 +489,7 @@ class MainActivity : ComponentActivity() {
         navigationController.stop()
         currentInstruction = null
         routeSummary = null
+        routeOptions = emptyList()
         activeDestination = null
         pendingRouteDestination = null
         mockRoutePrepared = false
@@ -468,6 +498,8 @@ class MainActivity : ComponentActivity() {
     private fun savePreferences(value: UserPreferences) {
         userPreferences = value
         userPreferencesStore.save(value)
+        screenNarrator.setLanguage(value.language.languageTag)
+        placeSearchController.setLanguage(value.language.languageTag)
         navigationController.setVoiceEnabled(
             !guidancePaused && value.guidanceMode != GuidanceMode.HAPTIC_ONLY,
         )
@@ -584,6 +616,7 @@ class MainActivity : ComponentActivity() {
             ),
             mappedTrafficLightCount = 1,
         )
+        routeOptions = listOfNotNull(routeSummary)
         mockRoutePrepared = true
         navigationStatus =
             "Simulated route ready; it does not represent real streets or the selected destination"
@@ -625,6 +658,7 @@ class MainActivity : ComponentActivity() {
         mainHandler.removeCallbacksAndMessages(null)
         screenNarrator.close()
         locationController.close()
+        placeSearchController.cancel()
         inputTipsController.cancel()
         speechRecognizer?.cancel()
         speechRecognizer?.destroy()

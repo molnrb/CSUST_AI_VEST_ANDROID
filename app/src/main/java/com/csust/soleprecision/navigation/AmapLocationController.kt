@@ -67,6 +67,12 @@ class AmapLocationController(
             }
             return
         }
+        if (!LocationValidity.isValidCoordinate(location.latitude, location.longitude)) {
+            if (!useSystemLocationFallback()) {
+                onStatus("AMap returned an invalid current position")
+            }
+            return
+        }
         val accuracy = location.accuracy.takeIf { it.isFinite() && it > 0f }
         val confidence = when {
             accuracy == null -> LocationConfidence.UNKNOWN
@@ -118,6 +124,10 @@ class AmapLocationController(
             .mapNotNull { provider ->
                 runCatching { manager.getLastKnownLocation(provider) }.getOrNull()
             }
+            .filter {
+                LocationValidity.isValidCoordinate(it.latitude, it.longitude) &&
+                    LocationValidity.isFresh(it.time)
+            }
             .maxByOrNull { it.time }
         if (rawLocation != null && emitSystemLocation(rawLocation)) return true
 
@@ -165,6 +175,12 @@ class AmapLocationController(
     }
 
     private fun emitSystemLocation(rawLocation: Location): Boolean {
+        if (
+            !LocationValidity.isValidCoordinate(rawLocation.latitude, rawLocation.longitude) ||
+            !LocationValidity.isFresh(rawLocation.time)
+        ) {
+            return false
+        }
         val converted = runCatching {
             CoordinateConverter(appContext)
                 .from(CoordinateConverter.CoordType.GPS)
@@ -172,17 +188,19 @@ class AmapLocationController(
                 .convert()
         }.getOrNull() ?: return false
 
+        val accuracy = rawLocation.accuracy.takeIf { it.isFinite() && it > 0f }
         onLocation(
             UserLocation(
                 latitude = converted.latitude,
                 longitude = converted.longitude,
                 address = "Current GPS position",
                 cityCode = "",
-                accuracyMeters = rawLocation.accuracy.takeIf { it.isFinite() && it > 0f },
+                accuracyMeters = accuracy,
                 source = "System GPS",
                 confidence = when {
-                    rawLocation.accuracy <= 20f -> LocationConfidence.HIGH
-                    rawLocation.accuracy <= 50f -> LocationConfidence.MEDIUM
+                    accuracy == null -> LocationConfidence.UNKNOWN
+                    accuracy <= 20f -> LocationConfidence.HIGH
+                    accuracy <= 50f -> LocationConfidence.MEDIUM
                     else -> LocationConfidence.LOW
                 },
             ),

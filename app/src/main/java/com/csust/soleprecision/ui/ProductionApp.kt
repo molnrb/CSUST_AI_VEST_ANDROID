@@ -108,6 +108,7 @@ private enum class ProductionScreen {
     SEARCHING,
     SEARCH_RESULTS,
     CONFIRM_PLACE,
+    ROUTE_OPTIONS,
     ROUTE_PREVIEW,
     ROUTE_WALKTHROUGH,
     ACTIVE_NAVIGATION,
@@ -132,6 +133,7 @@ fun SolePrecisionApp(
     destinationSearchState: DestinationSearchState,
     destinationSuggestions: List<DestinationSuggestion>,
     routeSummary: RouteSummary?,
+    routeOptions: List<RouteSummary>,
     recentDestinations: List<PlaceCandidate>,
     userPreferences: UserPreferences,
     useMockHardware: Boolean,
@@ -151,6 +153,7 @@ fun SolePrecisionApp(
     onSelectDestinationSuggestion: (DestinationSuggestion) -> Unit,
     onClearDestinationSearch: () -> Unit,
     onPlanRoute: (PlaceCandidate) -> Unit,
+    onSelectRoute: (Int) -> Boolean,
     onStartPlannedRoute: () -> Boolean,
     onRepeatInstruction: () -> Unit,
     onPauseGuidance: () -> Unit,
@@ -179,7 +182,15 @@ fun SolePrecisionApp(
 
                 LaunchedEffect(
                     screen,
-                    if (screen == ProductionScreen.ROUTE_PREVIEW) routeSummary else null,
+                    if (
+                        screen == ProductionScreen.ROUTE_PREVIEW ||
+                        screen == ProductionScreen.ROUTE_OPTIONS
+                    ) {
+                        routeSummary
+                    } else {
+                        null
+                    },
+                    routeOptions,
                     userPreferences.extraSpokenPrompts,
                 ) {
                     if (userPreferences.extraSpokenPrompts) {
@@ -246,6 +257,11 @@ fun SolePrecisionApp(
                         }
 
                         ProductionScreen.ROUTE_PREVIEW -> {
+                            onStopNavigation()
+                            screen = ProductionScreen.CONFIRM_PLACE
+                        }
+
+                        ProductionScreen.ROUTE_OPTIONS -> {
                             onStopNavigation()
                             screen = ProductionScreen.CONFIRM_PLACE
                         }
@@ -379,7 +395,7 @@ fun SolePrecisionApp(
                             onBack = { screen = ProductionScreen.DESTINATION },
                             onConfirm = {
                                 onPlanRoute(place)
-                                screen = ProductionScreen.ROUTE_PREVIEW
+                                screen = ProductionScreen.ROUTE_OPTIONS
                             },
                             onChooseAnother = {
                                 selectedPlace = null
@@ -389,6 +405,23 @@ fun SolePrecisionApp(
                     } ?: run {
                         screen = ProductionScreen.DESTINATION
                     }
+
+                    ProductionScreen.ROUTE_OPTIONS -> RouteOptionsScreen(
+                        routes = routeOptions,
+                        status = navigationStatus,
+                        locationStatus = locationStatus,
+                        currentLocation = currentLocation,
+                        onAnnounce = onAnnounceScreen,
+                        onBack = {
+                            onStopNavigation()
+                            screen = ProductionScreen.CONFIRM_PLACE
+                        },
+                        onSelect = { route ->
+                            if (onSelectRoute(route.routeId)) {
+                                screen = ProductionScreen.ROUTE_PREVIEW
+                            }
+                        },
+                    )
 
                     ProductionScreen.ROUTE_PREVIEW -> RoutePreviewScreen(
                         place = selectedPlace,
@@ -969,8 +1002,10 @@ private fun MapDestinationScreen(
         }
     }
     var pointedLocation by remember { mutableStateOf<LatLng?>(null) }
+    var pointedSuggestion by remember { mutableStateOf<DestinationSuggestion?>(null) }
     var resolvedAddress by remember { mutableStateOf<ResolvedMapAddress?>(null) }
     var pointStatus by remember { mutableStateOf("Tap the map to select a destination") }
+    var hasCenteredMap by remember(mapView) { mutableStateOf(false) }
     val reverseGeocoder = remember { AmapReverseGeocodeController(context) }
 
     LaunchedEffect(query) {
@@ -978,30 +1013,48 @@ private fun MapDestinationScreen(
         onRequestSuggestions(query)
     }
 
-    LaunchedEffect(mapView, currentLocation) {
-        val center = currentLocation?.let { LatLng(it.latitude, it.longitude) }
-            ?: LatLng(28.2282, 112.9388)
-        mapView.map.moveCamera(CameraUpdateFactory.newLatLngZoom(center, 16f))
+    LaunchedEffect(currentLocation) {
+        if (!hasCenteredMap && currentLocation != null) {
+            val center = LatLng(currentLocation.latitude, currentLocation.longitude)
+            mapView.map.moveCamera(CameraUpdateFactory.newLatLngZoom(center, 16f))
+            hasCenteredMap = true
+        }
+    }
+
+    LaunchedEffect(mapView) {
+        delay(1_200)
+        if (!hasCenteredMap) {
+            mapView.map.moveCamera(
+                CameraUpdateFactory.newLatLngZoom(LatLng(28.2282, 112.9388), 16f),
+            )
+            hasCenteredMap = true
+        }
     }
 
     val selectPoint = {
-        pointedLocation?.let { point ->
-            val resolved = resolvedAddress
-            onSelect(
-                PlaceCandidate(
-                    id = "map-${point.latitude}-${point.longitude}",
-                    name = resolved?.name ?: "Pinned map location",
-                    address = resolved?.address ?: "Selected on AMap",
-                    area = resolved?.area.orEmpty(),
-                    latitude = point.latitude,
-                    longitude = point.longitude,
-                ),
-            )
+        val suggestion = pointedSuggestion
+        if (suggestion != null && suggestion.poiId.isNotBlank()) {
+            onResolveSuggestion(suggestion)
+        } else {
+            pointedLocation?.let { point ->
+                val resolved = resolvedAddress
+                onSelect(
+                    PlaceCandidate(
+                        id = "map-${point.latitude}-${point.longitude}",
+                        name = resolved?.name ?: "Pinned map location",
+                        address = resolved?.address ?: "Selected on AMap",
+                        area = resolved?.area.orEmpty(),
+                        latitude = point.latitude,
+                        longitude = point.longitude,
+                    ),
+                )
+            }
         }
         Unit
     }
     val markPoint: (LatLng) -> Unit = { point ->
         pointedLocation = point
+        pointedSuggestion = null
         resolvedAddress = null
         pointStatus = "Finding address…"
         mapView.map.apply {
@@ -1033,6 +1086,7 @@ private fun MapDestinationScreen(
             onRequestSuggestions("")
             val point = LatLng(latitude, longitude)
             pointedLocation = point
+            pointedSuggestion = suggestion
             resolvedAddress = ResolvedMapAddress(
                 name = suggestion.name,
                 address = suggestion.address.ifBlank { "Selected from AMap search" },
@@ -1058,6 +1112,7 @@ private fun MapDestinationScreen(
             currentMarkPoint(point)
         }
         onDispose {
+            reverseGeocoder.cancel()
             mapView.map.setOnMapClickListener(null)
             mapView.map.isMyLocationEnabled = false
             mapView.onPause()
@@ -1168,6 +1223,7 @@ private fun MapDestinationScreen(
             OutlinedButton(
                 onClick = {
                     pointedLocation = null
+                    pointedSuggestion = null
                     resolvedAddress = null
                     pointStatus = "Tap the map to select a destination"
                     mapView.map.clear()
@@ -1420,12 +1476,8 @@ private fun SearchResultsScreen(
 
     LaunchedEffect(index, current?.id, distance) {
         current?.let { place ->
-            val address = listOf(place.address, place.area)
-                .filter(String::isNotBlank)
-                .distinct()
-                .joinToString(", ")
             onAnnounce(
-                "Option ${index + 1} of ${results.size}. ${place.name}. $address. " +
+                "Option ${index + 1} of ${results.size}. ${place.spokenDescription}. " +
                     "$distance. Swipe right to confirm, left to decline and hear the next option, " +
                     "or down to go back.",
             )
@@ -1575,6 +1627,16 @@ private fun ConfirmPlaceScreen(
                 fontWeight = FontWeight.Black,
                 textAlign = TextAlign.Center,
             )
+            if (place.accessibilityDetails.isNotBlank()) {
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    place.accessibilityDetails,
+                    fontSize = 22.sp,
+                    lineHeight = 30.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                )
+            }
         }
         return
     }
@@ -1605,6 +1667,81 @@ private fun ConfirmPlaceScreen(
         LargeOutlinedAction(
             "Choose another place",
             onClick = onChooseAnother,
+        )
+    }
+}
+
+@Composable
+private fun RouteOptionsScreen(
+    routes: List<RouteSummary>,
+    status: String,
+    locationStatus: String,
+    currentLocation: UserLocation?,
+    onAnnounce: (String) -> Unit,
+    onBack: () -> Unit,
+    onSelect: (RouteSummary) -> Unit,
+) {
+    var index by rememberSaveable(routes.map { it.routeId }) { mutableStateOf(0) }
+    LaunchedEffect(routes.map { it.routeId }) {
+        if (index !in routes.indices) index = 0
+    }
+    val route = routes.getOrNull(index)
+
+    LaunchedEffect(index, route, status) {
+        if (route != null) {
+            onAnnounce(
+                "Walking route ${index + 1} of ${routes.size}. ${route.mentalMapSummary}. " +
+                    if (routes.size > 1) {
+                        "Swipe right to choose this route, left for the next route, or down to go back."
+                    } else {
+                        "Swipe right to choose this route or down to go back."
+                    },
+            )
+        }
+    }
+
+    val actions = buildMap {
+        if (route != null && routes.size > 1) {
+            put(
+                SwipeDirection.LEFT,
+                SwipeAction("Next route", "←", Color.White),
+            )
+        }
+        if (route != null) {
+            put(
+                SwipeDirection.RIGHT,
+                SwipeAction("Choose route", "✓", MaterialTheme.colorScheme.primary),
+            )
+        }
+        put(
+            SwipeDirection.DOWN,
+            SwipeAction("Back", "↩", Color.White),
+        )
+    }
+
+    SwipeOnlyScreen(
+        title = if (route == null) "Preparing walking routes" else
+            "Route ${index + 1} of ${routes.size}",
+        actions = actions,
+        onSwipe = { direction ->
+            when (direction) {
+                SwipeDirection.LEFT -> if (routes.size > 1) {
+                    index = (index + 1) % routes.size
+                }
+                SwipeDirection.RIGHT -> route?.let(onSelect)
+                SwipeDirection.DOWN -> onBack()
+                SwipeDirection.UP -> Unit
+            }
+        },
+    ) {
+        Text(
+            route?.mentalMapSummary
+                ?: if (currentLocation == null) locationStatus else status,
+            fontSize = 28.sp,
+            lineHeight = 38.sp,
+            fontWeight = FontWeight.Black,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
         )
     }
 }
@@ -1684,7 +1821,7 @@ private fun RoutePreviewScreen(
                     )
                 }
                 Text(
-                    "${summary.spokenDistance}, approximately ${summary.durationMinutes} minutes.",
+                    summary.mentalMapSummary,
                     fontSize = 27.sp,
                     lineHeight = 36.sp,
                     fontWeight = FontWeight.Bold,
@@ -1742,7 +1879,8 @@ private fun RoutePreviewScreen(
                 modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
             )
             Text(
-                "Obstacle detection remains local to the backpack and has priority over route guidance.",
+                "The current app provides route guidance only. Future local backpack obstacle " +
+                    "warnings must have priority over route guidance.",
                 fontSize = 20.sp,
                 lineHeight = 29.sp,
             )
@@ -1767,7 +1905,13 @@ private fun RouteWalkthroughScreen(
     onBack: () -> Unit,
 ) {
     val steps = summary?.steps.orEmpty()
-    var index by rememberSaveable(steps.size) { mutableStateOf(0) }
+    var index by rememberSaveable(
+        summary?.routeId,
+        summary?.pathCoordinates?.hashCode(),
+        steps.size,
+    ) {
+        mutableStateOf(0)
+    }
     val step = steps.getOrNull(index)
 
     LaunchedEffect(index, step) {
@@ -1829,8 +1973,19 @@ private fun RouteWalkthroughScreen(
         if (step?.maneuver == Maneuver.CROSSWALK) {
             Spacer(Modifier.height(12.dp))
             Text(
-                "Mapped crossing: confirm the real crossing and traffic state with the " +
-                    "camera system before entering it.",
+                "Mapped crossing: confirm the real crossing and traffic state before entering. " +
+                    "The current app cannot verify that it is safe to cross.",
+                color = MaterialTheme.colorScheme.primary,
+                fontSize = 22.sp,
+                lineHeight = 30.sp,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+            )
+        }
+        if (step?.needsEnvironmentalConfirmation == true && step.maneuver != Maneuver.CROSSWALK) {
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "Mapped feature: confirm the real surroundings before continuing.",
                 color = MaterialTheme.colorScheme.primary,
                 fontSize = 22.sp,
                 lineHeight = 30.sp,
@@ -1873,7 +2028,7 @@ private fun PausedScreen(
     NativeNavigationMap(
         instruction = instruction,
         navigationStatus = "Guidance paused",
-        wearableStatus = "Obstacle detection remains active",
+        wearableStatus = "The current app does not verify nearby obstacles",
         routeSummary = null,
         naviView = naviView,
         isPaused = true,
@@ -2255,7 +2410,8 @@ private fun DeviceSettingsScreen(
         )
 
         Text(
-            "Immediate obstacle detection cannot be disabled here. It must always override navigation guidance.",
+            "When the device is integrated, immediate local obstacle detection must not be " +
+                "disabled here and must always override navigation guidance.",
             color = MaterialTheme.colorScheme.primary,
             fontSize = 20.sp,
             lineHeight = 29.sp,
@@ -2690,12 +2846,19 @@ private fun ProductionScreen.spokenIntroduction(
 
     ProductionScreen.CONFIRM_PLACE ->
         if (useDirectionalLayout) {
-            "Confirm destination ${place?.name ?: ""}. Swipe right to confirm, left to decline, " +
+            "Confirm destination ${place?.spokenDescription ?: ""}. " +
+                "Swipe right to confirm, left to decline, " +
                 "or down to go back."
         } else {
             "Confirm destination ${place?.name ?: ""}. " +
                 "Yes, use this place is above Choose another place."
         }
+
+    ProductionScreen.ROUTE_OPTIONS -> routeSummary?.let {
+        "Choose a walking route. ${it.mentalMapSummary}. " +
+            "Swipe right to choose the current route, left for another route when available, " +
+            "or down to go back."
+    } ?: "AMap is preparing walking route choices. Swipe down to go back."
 
     ProductionScreen.ROUTE_PREVIEW -> routeSummary?.let {
         val mode = if (isSimulation) {
@@ -2704,7 +2867,7 @@ private fun ProductionScreen.spokenIntroduction(
             ""
         }
         mode + "Route preview for ${place?.name ?: "the selected destination"}. " +
-            "The route is ${it.spokenDistance}, approximately ${it.durationMinutes} minutes. " +
+            "${it.mentalMapSummary}. " +
             if (useDirectionalLayout) {
                 if (it.steps.isNotEmpty()) {
                     "Swipe up to review all ${it.steps.size} walking steps, right to start, " +
@@ -2808,6 +2971,7 @@ private fun ProductionScreen.backDestination(): ProductionScreen = when (this) {
 
     ProductionScreen.MAP_DESTINATION -> ProductionScreen.DESTINATION_METHODS
     ProductionScreen.CONFIRM_PLACE -> ProductionScreen.DESTINATION
+    ProductionScreen.ROUTE_OPTIONS -> ProductionScreen.CONFIRM_PLACE
     ProductionScreen.ROUTE_PREVIEW -> ProductionScreen.CONFIRM_PLACE
     ProductionScreen.ROUTE_WALKTHROUGH -> ProductionScreen.ROUTE_PREVIEW
     ProductionScreen.ACTIVE_NAVIGATION -> ProductionScreen.PAUSED

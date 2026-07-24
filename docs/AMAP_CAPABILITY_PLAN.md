@@ -18,14 +18,26 @@ The current implementation uses them for:
   converted Android-GPS fallback;
 - location-biased input tips, POI search, exact POI-ID lookup and individually
   presented candidates;
+- full POI detail requests, including AMap category, mapped entrance/exit,
+  indoor floor, business tags and child POIs when the dataset supplies them;
 - typed AMap suggestions pinned directly on the full-screen map, with manual
   map-point selection available in the same screen;
-- POI-ID walking-route calculation and simulated or GPS navigation;
+- POI-ID and mapped-entrance walking-route calculation and simulated or GPS
+  navigation;
+- native multi-route walking calculation, exact AMap route-ID selection and
+  one-route-at-a-time accessible comparison;
 - a pre-start route walkthrough built from ordered AMap walking steps, including
-  manoeuvre, distance, road name and mapped traffic-light count;
+  manoeuvre, distance, road name, compass orientation, approximate turn angle
+  and mapped traffic-light count;
+- an on-device mental-map summary with initial direction, turn count,
+  crosswalk count, traffic-light count, level changes and bridge/passage
+  complexity;
 - live navigation callbacks converted into wearable direction packets;
-- metres to the next action plus mapped crosswalk, stairs and elevator
-  manoeuvres exposed by the walking route;
+- metres to the next action calculated from the matched walking position and
+  route geometry rather than the SDK's driving-only step-distance field;
+- mapped crosswalk, stairs, elevator, escalator, ramp, bridge, tunnel,
+  overpass, underpass, pedestrian-way, building entry/exit, subway-passage,
+  ferry and roundabout manoeuvres exposed by the walking route;
 - weak-GPS, GPS-disabled and off-route recalculation status;
 - native AMap voice announcements;
 - native map pan/zoom, current-location controls, indoor-map support, map-point
@@ -47,12 +59,12 @@ SDK view.
 | Priority | User need | AMap capability | Decision |
 | --- | --- | --- | --- |
 | 1 | Resolve ambiguous spoken or typed places | Search SDK input tips, POI keyword search and exact POI lookup | Integrated with location-biased suggestions and one accessible result at a time |
-| 2 | Route to the correct entrance of a large place | POI IDs and POI-based walking route requests | Integrated; POI ID is preferred with coordinates as fallback |
+| 2 | Route to the correct entrance of a large place | Rich POI NAVI fields and POI-based walking route requests | Integrated; mapped entrance and POI ID are preferred with POI coordinates as fallback |
 | 3 | Detect unreliable outdoor guidance | Continuous Location SDK updates, accuracy, location type and failure codes | Integrated in the app status model |
 | 4 | Recover when the user leaves the route | Navigation SDK GPS, off-route and recalculation callbacks | Integrated as concise guidance status events |
 | 5 | Let a helper choose a visible point | Native map, markers and Search SDK reverse geocoding | Integrated now |
 | 6 | Find useful nearby categories | POI around-search | Add only for focused requests such as entrances, bus stops or toilets; do not continuously announce everything |
-| 7 | Analyze routes on a server | Web Route Planning 2.0 | Optional later; use behind a backend, not for the live on-phone navigation loop |
+| 7 | Analyze routes on a server | Web Route Planning 2.0 | Out of scope: this project has no backend and does not embed Web Service keys |
 | 8 | Normalize raw GPS coordinates | Android SDK coordinate conversion | Integrated for the system-GPS fallback |
 | 9 | Correct uploaded vehicle traces | Web trajectory correction | Do not use for immediate pedestrian safety; it is not an obstacle-avoidance system |
 
@@ -84,10 +96,23 @@ system does not speak continuously.
 Use the Android SDKs for the real-time app flow. They already provide location,
 POI search, map interaction and walking navigation with native callbacks.
 
-Use Web Services only when a backend needs server-side route analysis or data
-processing. Web Route Planning 2.0 and Web geocoding require a separate Web
-Service key. That key must not be embedded in the APK. The Android key remains
-restricted to the application ID and signing certificates.
+This project intentionally has no backend. Web Route Planning 2.0, Web
+geocoding, coordinate conversion and trajectory correction are therefore not
+used: their Web Service key must not be embedded in the APK. The Android app
+uses only the signed native SDK integration and keeps route analysis on-device.
+The Android key remains restricted to the application ID and signing
+certificates.
+
+## Current boundary
+
+The on-device app can describe only what AMap maps. It cannot know whether a
+temporary barrier, parked scooter, construction zone, crowd, open drain, silent
+vehicle or signal state is present. A mapped crosswalk is not permission to
+cross. Every route summary and special-feature instruction therefore uses
+“mapped” language and asks the user to confirm the real environment.
+
+No new wearable or robotics interface is part of this implementation. Existing
+mock/BLE engineering code remains isolated for later team testing.
 
 ## Official references
 

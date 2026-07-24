@@ -17,24 +17,58 @@ data class ResolvedMapAddress(
 
 class AmapReverseGeocodeController(
     context: Context,
-) : GeocodeSearch.OnGeocodeSearchListener {
+) {
     private val appContext = context.applicationContext
-    private val search = GeocodeSearch(
-        appContext.also {
-            ServiceSettings.updatePrivacyShow(it, true, true)
-            ServiceSettings.updatePrivacyAgree(it, true)
-        },
-    ).also {
-        it.setOnGeocodeSearchListener(this)
+    private var requestSerial = 0
+
+    init {
+        ServiceSettings.updatePrivacyShow(appContext, true, true)
+        ServiceSettings.updatePrivacyAgree(appContext, true)
     }
-    private var callback: ((Result<ResolvedMapAddress>) -> Unit)? = null
 
     fun resolve(
         latitude: Double,
         longitude: Double,
         onResult: (Result<ResolvedMapAddress>) -> Unit,
     ) {
-        callback = onResult
+        val serial = ++requestSerial
+        val search = GeocodeSearch(appContext)
+        search.setOnGeocodeSearchListener(
+            object : GeocodeSearch.OnGeocodeSearchListener {
+                override fun onRegeocodeSearched(result: RegeocodeResult?, errorCode: Int) {
+                    if (serial != requestSerial) return
+                    if (errorCode != AMapException.CODE_AMAP_SUCCESS) {
+                        onResult(
+                            Result.failure(
+                                IllegalStateException("AMap address lookup failed ($errorCode)"),
+                            ),
+                        )
+                        return
+                    }
+
+                    val address = result?.regeocodeAddress
+                    val formatted = address?.formatAddress.orEmpty()
+                    val nearestPoi = address?.pois.orEmpty().firstOrNull()?.title.orEmpty()
+                    val area = listOf(
+                        address?.city.orEmpty(),
+                        address?.district.orEmpty(),
+                    ).filter(String::isNotBlank).distinct().joinToString(", ")
+                    onResult(
+                        Result.success(
+                            ResolvedMapAddress(
+                                name = nearestPoi.ifBlank {
+                                    formatted.ifBlank { "Pinned map location" }
+                                },
+                                address = formatted.ifBlank { "Selected on AMap" },
+                                area = area,
+                            ),
+                        ),
+                    )
+                }
+
+                override fun onGeocodeSearched(result: GeocodeResult?, errorCode: Int) = Unit
+            },
+        )
         search.getFromLocationAsyn(
             RegeocodeQuery(
                 LatLonPoint(latitude, longitude),
@@ -44,31 +78,7 @@ class AmapReverseGeocodeController(
         )
     }
 
-    override fun onRegeocodeSearched(result: RegeocodeResult?, errorCode: Int) {
-        val pending = callback ?: return
-        callback = null
-        if (errorCode != AMapException.CODE_AMAP_SUCCESS) {
-            pending(Result.failure(IllegalStateException("AMap address lookup failed ($errorCode)")))
-            return
-        }
-
-        val address = result?.regeocodeAddress
-        val formatted = address?.formatAddress.orEmpty()
-        val nearestPoi = address?.pois.orEmpty().firstOrNull()?.title.orEmpty()
-        val area = listOf(
-            address?.city.orEmpty(),
-            address?.district.orEmpty(),
-        ).filter(String::isNotBlank).distinct().joinToString(", ")
-        pending(
-            Result.success(
-                ResolvedMapAddress(
-                    name = nearestPoi.ifBlank { formatted.ifBlank { "Pinned map location" } },
-                    address = formatted.ifBlank { "Selected on AMap" },
-                    area = area,
-                ),
-            ),
-        )
+    fun cancel() {
+        requestSerial += 1
     }
-
-    override fun onGeocodeSearched(result: GeocodeResult?, errorCode: Int) = Unit
 }

@@ -15,6 +15,20 @@ object AmapManeuverMapper {
         IconType.CROSSWALK -> Maneuver.CROSSWALK
         IconType.STAIRCASE, IconType.BY_STAIR, IconType.LADDER -> Maneuver.STAIRS
         IconType.LIFT, IconType.BY_ELEVATOR -> Maneuver.ELEVATOR
+        IconType.OVERPASS, IconType.SKY_CHANNEL -> Maneuver.OVERPASS
+        IconType.UNDERPASS, IconType.CHANNEL -> Maneuver.UNDERPASS
+        IconType.BY_ESCALATOR -> Maneuver.ESCALATOR
+        IconType.SLOPE -> Maneuver.RAMP
+        IconType.BRIDGE -> Maneuver.BRIDGE
+        IconType.ARRIVED_TUNNEL -> Maneuver.TUNNEL
+        IconType.WALK_ROAD, IconType.LOW_TRAFFIC_CROSS, IconType.LOW_CROSS ->
+            Maneuver.PEDESTRIAN_WAY
+        IconType.ENTER_BUILDING -> Maneuver.ENTER_BUILDING
+        IconType.LEAVE_BUILDING -> Maneuver.LEAVE_BUILDING
+        IconType.SUBWAY -> Maneuver.SUBWAY_PASSAGE
+        IconType.FERRY, IconType.CRUISE_ROUTE -> Maneuver.FERRY
+        IconType.ENTER_ROUNDABOUT, IconType.OUT_ROUNDABOUT -> Maneuver.ROUNDABOUT
+        IconType.SQUARE, IconType.PARK -> Maneuver.PARK_OR_SQUARE
         IconType.ARRIVED_DESTINATION -> Maneuver.ARRIVED
         else -> Maneuver.UNKNOWN
     }
