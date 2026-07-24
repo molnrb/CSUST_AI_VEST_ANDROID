@@ -20,6 +20,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
 import androidx.core.content.ContextCompat
+import com.csust.soleprecision.device.DeviceTestCommand
+import com.csust.soleprecision.device.DeviceTestPacketEncoder
 import com.csust.soleprecision.navigation.NavigationInstruction
 import com.csust.soleprecision.navigation.NavigationPacketEncoder
 import java.util.UUID
@@ -88,13 +90,13 @@ class BleWearableTransport(
             }
             writeCharacteristic = gatt
                 .getService(SERVICE_UUID)
-                ?.getCharacteristic(NAVIGATION_CHARACTERISTIC_UUID)
+                ?.getCharacteristic(COMMAND_CHARACTERISTIC_UUID)
 
             onStatus(
                 if (writeCharacteristic != null) {
                     "Wearable ready"
                 } else {
-                    "Connected, but navigation control was not found"
+                    "Connected, but command control was not found"
                 },
             )
         }
@@ -144,6 +146,23 @@ class BleWearableTransport(
     @Suppress("DEPRECATION")
     override fun send(instruction: NavigationInstruction): Boolean {
         val packet = NavigationPacketEncoder.encode(instruction, sequence++)
+        return writePacket(packet)
+    }
+
+    @SuppressLint("MissingPermission")
+    @Suppress("DEPRECATION")
+    override fun send(command: DeviceTestCommand): Boolean {
+        val packet = DeviceTestPacketEncoder.encode(command, sequence++)
+        return writePacket(packet)
+    }
+
+    @SuppressLint("MissingPermission")
+    @Suppress("DEPRECATION")
+    override fun sendRaw(packet: ByteArray): Boolean = writePacket(packet)
+
+    @SuppressLint("MissingPermission")
+    @Suppress("DEPRECATION")
+    private fun writePacket(packet: ByteArray): Boolean {
         onPacketPrepared(NavigationPacketEncoder.toHex(packet))
 
         if (!hasBluetoothPermissions()) return false
@@ -193,7 +212,7 @@ class BleWearableTransport(
 
         // These UUIDs must be copied exactly into the ESP32 firmware.
         val SERVICE_UUID: UUID = UUID.fromString("5c10a001-9c1b-4c7f-9c6a-43d42f2d1000")
-        val NAVIGATION_CHARACTERISTIC_UUID: UUID =
+        val COMMAND_CHARACTERISTIC_UUID: UUID =
             UUID.fromString("5c10a002-9c1b-4c7f-9c6a-43d42f2d1000")
     }
 }
