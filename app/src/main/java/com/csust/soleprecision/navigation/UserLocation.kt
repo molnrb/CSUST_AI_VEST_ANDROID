@@ -8,6 +8,9 @@ data class UserLocation(
     val accuracyMeters: Float? = null,
     val source: String = "Unknown",
     val confidence: LocationConfidence = LocationConfidence.UNKNOWN,
+    // City name and district adcode as reported by AMap; used for weather lookups.
+    val cityName: String = "",
+    val adCode: String = "",
 )
 
 enum class LocationConfidence {

@@ -16,6 +16,9 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Directional turn cues on the phone itself, for users who cannot hear speech
+         or are not wearing the backpack yet. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <uses-permission
         android:name="android.permission.BLUETOOTH"

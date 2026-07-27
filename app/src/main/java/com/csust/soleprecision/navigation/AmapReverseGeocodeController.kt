@@ -13,6 +13,8 @@ data class ResolvedMapAddress(
     val name: String,
     val address: String,
     val area: String,
+    /** Nearest named point of interest, used as a landmark anchor for cues. */
+    val nearestPoiName: String = "",
 )
 
 class AmapReverseGeocodeController(
@@ -61,6 +63,7 @@ class AmapReverseGeocodeController(
                                 },
                                 address = formatted.ifBlank { "Selected on AMap" },
                                 area = area,
+                                nearestPoiName = nearestPoi,
                             ),
                         ),
                     )

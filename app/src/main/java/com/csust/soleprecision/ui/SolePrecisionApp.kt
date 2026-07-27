@@ -50,6 +50,7 @@ import com.csust.soleprecision.device.AudioCue
 import com.csust.soleprecision.device.DeviceTestCommand
 import com.csust.soleprecision.device.OutputSide
 import com.csust.soleprecision.device.VibrationPattern
+import com.csust.soleprecision.navigation.LocationValidity
 import com.csust.soleprecision.navigation.Maneuver
 import com.csust.soleprecision.navigation.NavigationInstruction
 
@@ -441,23 +442,23 @@ internal fun EngineeringTestConsole(
             PrimaryAction(
                 if (simulateMovement) "Start stationary AMap simulation" else "Start GPS navigation",
             ) {
-                val values = listOf(
-                    startLatitude.toDoubleOrNull(),
-                    startLongitude.toDoubleOrNull(),
-                    endLatitude.toDoubleOrNull(),
-                    endLongitude.toDoubleOrNull(),
-                )
-                if (values.any { it == null }) {
-                    routeError = "Enter four valid decimal coordinates"
-                } else {
-                    routeError = null
-                    onStartWalkingRoute(
-                        values[0]!!,
-                        values[1]!!,
-                        values[2]!!,
-                        values[3]!!,
-                        simulateMovement,
-                    )
+                val startLat = startLatitude.toDoubleOrNull()
+                val startLng = startLongitude.toDoubleOrNull()
+                val endLat = endLatitude.toDoubleOrNull()
+                val endLng = endLongitude.toDoubleOrNull()
+                when {
+                    startLat == null || startLng == null || endLat == null || endLng == null ->
+                        routeError = "Enter four valid decimal coordinates"
+                    !LocationValidity.isValidCoordinate(startLat, startLng) ->
+                        routeError = "Start coordinates are out of range"
+                    !LocationValidity.isValidCoordinate(endLat, endLng) ->
+                        routeError = "Destination coordinates are out of range"
+                    startLat == endLat && startLng == endLng ->
+                        routeError = "Start and destination must differ"
+                    else -> {
+                        routeError = null
+                        onStartWalkingRoute(startLat, startLng, endLat, endLng, simulateMovement)
+                    }
                 }
             }
             OutlinedButton(

@@ -24,8 +24,19 @@ import com.csust.soleprecision.device.DeviceTestCommand
 import com.csust.soleprecision.device.DeviceTestPacketEncoder
 import com.csust.soleprecision.navigation.NavigationInstruction
 import com.csust.soleprecision.navigation.NavigationPacketEncoder
+import java.util.ArrayDeque
 import java.util.UUID
 
+/**
+ * Temporary BLE transport hardened for engineering use:
+ * - GATT writes are serialized through a queue and confirmed via onCharacteristicWrite,
+ *   because Android allows only one write in flight per connection;
+ * - unexpected disconnects trigger a bounded reconnect with backoff;
+ * - connecting has a timeout so a silent peripheral cannot hang the state machine;
+ * - a larger MTU is requested before service discovery.
+ * The 12-byte wire format and UUIDs are unchanged placeholders from
+ * docs/TEMPORARY_DEVICE_PROTOCOL.md until the hardware team's real contract exists.
+ */
 class BleWearableTransport(
     context: Context,
     private val onStatus: (String) -> Unit,
@@ -38,19 +49,22 @@ class BleWearableTransport(
     private var gatt: BluetoothGatt? = null
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
     private var sequence = 0
+    private var userRequestedDisconnect = false
+    private var reconnectAttempts = 0
+    private var lastDevice: BluetoothDevice? = null
+
+    private val writeQueue = ArrayDeque<ByteArray>()
+    private var writeInFlight = false
 
     private val scanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             mainHandler.removeCallbacks(scanTimeout)
-            adapter?.bluetoothLeScanner?.stopScan(this)
+            if (hasBluetoothPermissions()) {
+                adapter?.bluetoothLeScanner?.stopScan(this)
+            }
             onStatus("Found wearable; connecting…")
-            gatt = result.device.connectGatt(
-                appContext,
-                false,
-                gattCallback,
-                BluetoothDevice.TRANSPORT_LE,
-            )
+            connectToDevice(result.device)
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -64,41 +78,102 @@ class BleWearableTransport(
         onStatus("No Sole Precision wearable found")
     }
 
+    private val connectTimeout = Runnable {
+        if (writeCharacteristic == null) {
+            onStatus("Wearable connection timed out")
+            closeGattQuietly()
+            scheduleReconnectIfWanted()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun connectToDevice(device: BluetoothDevice) {
+        lastDevice = device
+        mainHandler.removeCallbacks(connectTimeout)
+        mainHandler.postDelayed(connectTimeout, CONNECT_TIMEOUT_MS)
+        gatt = device.connectGatt(
+            appContext,
+            false,
+            gattCallback,
+            BluetoothDevice.TRANSPORT_LE,
+        )
+    }
+
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    onStatus("Wearable connected; discovering controls…")
-                    gatt.discoverServices()
+                    mainHandler.post {
+                        mainHandler.removeCallbacks(connectTimeout)
+                        mainHandler.postDelayed(connectTimeout, CONNECT_TIMEOUT_MS)
+                        reconnectAttempts = 0
+                        onStatus("Wearable connected; negotiating link…")
+                        if (!gatt.requestMtu(REQUESTED_MTU)) {
+                            gatt.discoverServices()
+                        }
+                    }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    writeCharacteristic = null
-                    onStatus("Wearable disconnected")
-                    gatt.close()
-                    if (this@BleWearableTransport.gatt === gatt) {
-                        this@BleWearableTransport.gatt = null
+                    mainHandler.post {
+                        mainHandler.removeCallbacks(connectTimeout)
+                        writeCharacteristic = null
+                        clearWriteQueue()
+                        gatt.close()
+                        if (this@BleWearableTransport.gatt === gatt) {
+                            this@BleWearableTransport.gatt = null
+                        }
+                        if (userRequestedDisconnect) {
+                            onStatus("Wearable disconnected")
+                        } else {
+                            onStatus("Wearable connection lost")
+                            scheduleReconnectIfWanted()
+                        }
                     }
                 }
             }
         }
 
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                onStatus("Wearable service discovery failed")
-                return
+        @SuppressLint("MissingPermission")
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            mainHandler.post {
+                gatt.discoverServices()
             }
-            writeCharacteristic = gatt
-                .getService(SERVICE_UUID)
-                ?.getCharacteristic(COMMAND_CHARACTERISTIC_UUID)
+        }
 
-            onStatus(
-                if (writeCharacteristic != null) {
-                    "Wearable ready"
-                } else {
-                    "Connected, but command control was not found"
-                },
-            )
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            mainHandler.post {
+                mainHandler.removeCallbacks(connectTimeout)
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    onStatus("Wearable service discovery failed ($status)")
+                    return@post
+                }
+                writeCharacteristic = gatt
+                    .getService(SERVICE_UUID)
+                    ?.getCharacteristic(COMMAND_CHARACTERISTIC_UUID)
+
+                onStatus(
+                    if (writeCharacteristic != null) {
+                        "Wearable ready"
+                    } else {
+                        "Connected, but command control was not found"
+                    },
+                )
+            }
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int,
+        ) {
+            mainHandler.post {
+                writeInFlight = false
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    onStatus("Wearable write failed ($status)")
+                }
+                drainWriteQueue()
+            }
         }
     }
 
@@ -118,6 +193,22 @@ class BleWearableTransport(
             return
         }
 
+        userRequestedDisconnect = false
+        reconnectAttempts = 0
+        startScan()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startScan() {
+        if (!hasBluetoothPermissions()) {
+            onStatus("Bluetooth permission is required")
+            return
+        }
+        val scanner = adapter?.bluetoothLeScanner
+        if (scanner == null) {
+            onStatus("Turn on Bluetooth, then try again")
+            return
+        }
         onStatus("Looking for Sole Precision wearable…")
         val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(SERVICE_UUID))
@@ -125,13 +216,36 @@ class BleWearableTransport(
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
-        bluetoothAdapter.bluetoothLeScanner.startScan(listOf(filter), settings, scanCallback)
+        scanner.startScan(listOf(filter), settings, scanCallback)
+        mainHandler.removeCallbacks(scanTimeout)
         mainHandler.postDelayed(scanTimeout, SCAN_TIMEOUT_MS)
+    }
+
+    private fun scheduleReconnectIfWanted() {
+        if (userRequestedDisconnect) return
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            onStatus("Wearable reconnect failed; connect manually when it is available")
+            return
+        }
+        reconnectAttempts += 1
+        val delayMs = RECONNECT_BASE_DELAY_MS shl (reconnectAttempts - 1)
+        onStatus("Reconnecting to wearable (attempt $reconnectAttempts)…")
+        mainHandler.postDelayed(
+            {
+                if (!userRequestedDisconnect && gatt == null) {
+                    startScan()
+                }
+            },
+            delayMs,
+        )
     }
 
     @SuppressLint("MissingPermission")
     override fun disconnect() {
+        userRequestedDisconnect = true
         mainHandler.removeCallbacks(scanTimeout)
+        mainHandler.removeCallbacks(connectTimeout)
+        clearWriteQueue()
         if (hasBluetoothPermissions()) {
             stopScanning()
             gatt?.disconnect()
@@ -142,32 +256,42 @@ class BleWearableTransport(
         onStatus("Wearable disconnected")
     }
 
-    @SuppressLint("MissingPermission")
-    @Suppress("DEPRECATION")
     override fun send(instruction: NavigationInstruction): Boolean {
         val packet = NavigationPacketEncoder.encode(instruction, sequence++)
-        return writePacket(packet)
+        return enqueuePacket(packet)
     }
 
-    @SuppressLint("MissingPermission")
-    @Suppress("DEPRECATION")
     override fun send(command: DeviceTestCommand): Boolean {
         val packet = DeviceTestPacketEncoder.encode(command, sequence++)
-        return writePacket(packet)
+        return enqueuePacket(packet)
     }
 
-    @SuppressLint("MissingPermission")
-    @Suppress("DEPRECATION")
-    override fun sendRaw(packet: ByteArray): Boolean = writePacket(packet)
+    override fun sendRaw(packet: ByteArray): Boolean = enqueuePacket(packet)
 
-    @SuppressLint("MissingPermission")
-    @Suppress("DEPRECATION")
-    private fun writePacket(packet: ByteArray): Boolean {
+    private fun enqueuePacket(packet: ByteArray): Boolean {
         onPacketPrepared(NavigationPacketEncoder.toHex(packet))
 
         if (!hasBluetoothPermissions()) return false
-        val currentGatt = gatt ?: return false
-        val characteristic = writeCharacteristic ?: return false
+        if (gatt == null || writeCharacteristic == null) return false
+
+        // Drop the oldest waiting packets rather than delivering stale guidance late.
+        while (writeQueue.size >= MAX_QUEUED_PACKETS) {
+            writeQueue.pollFirst()
+        }
+        writeQueue.addLast(packet)
+        drainWriteQueue()
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    @Suppress("DEPRECATION")
+    private fun drainWriteQueue() {
+        if (writeInFlight) return
+        val currentGatt = gatt ?: return clearWriteQueue()
+        val characteristic = writeCharacteristic ?: return clearWriteQueue()
+        val packet = writeQueue.pollFirst() ?: return
+        if (!hasBluetoothPermissions()) return clearWriteQueue()
+
         val writeType = if (
             characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
         ) {
@@ -176,7 +300,7 @@ class BleWearableTransport(
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         }
 
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val accepted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             currentGatt.writeCharacteristic(characteristic, packet, writeType) ==
                 BluetoothStatusCodes.SUCCESS
         } else {
@@ -184,6 +308,29 @@ class BleWearableTransport(
             characteristic.value = packet
             currentGatt.writeCharacteristic(characteristic)
         }
+        if (accepted) {
+            writeInFlight = true
+        } else {
+            onStatus("Wearable write was rejected; command dropped")
+            // Try the next packet so one rejection does not stall the queue.
+            mainHandler.post { drainWriteQueue() }
+        }
+    }
+
+    private fun clearWriteQueue() {
+        writeQueue.clear()
+        writeInFlight = false
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun closeGattQuietly() {
+        if (hasBluetoothPermissions()) {
+            gatt?.disconnect()
+            gatt?.close()
+        }
+        gatt = null
+        writeCharacteristic = null
+        clearWriteQueue()
     }
 
     override fun close() = disconnect()
@@ -209,6 +356,11 @@ class BleWearableTransport(
 
     companion object {
         private const val SCAN_TIMEOUT_MS = 10_000L
+        private const val CONNECT_TIMEOUT_MS = 15_000L
+        private const val RECONNECT_BASE_DELAY_MS = 2_000L
+        private const val MAX_RECONNECT_ATTEMPTS = 3
+        private const val MAX_QUEUED_PACKETS = 8
+        private const val REQUESTED_MTU = 64
 
         // These UUIDs must be copied exactly into the ESP32 firmware.
         val SERVICE_UUID: UUID = UUID.fromString("5c10a001-9c1b-4c7f-9c6a-43d42f2d1000")

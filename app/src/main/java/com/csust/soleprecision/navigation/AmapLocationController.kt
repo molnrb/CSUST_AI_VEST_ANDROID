@@ -33,18 +33,24 @@ class AmapLocationController(
             MapsInitializer.updatePrivacyAgree(appContext, true)
             AMapLocationClient.updatePrivacyShow(appContext, true, true)
             AMapLocationClient.updatePrivacyAgree(appContext, true)
-            client = AMapLocationClient(appContext).also { locationClient ->
+            val locationClient = AMapLocationClient(appContext)
+            try {
                 locationClient.setLocationListener(::handleLocation)
                 locationClient.setLocationOption(
                     AMapLocationClientOption().apply {
                         locationMode = AMapLocationClientOption.AMapLocationMode.Hight_Accuracy
                         isOnceLocation = false
                         interval = 2_000
-                        isNeedAddress = false
+                        // Address, city and adcode feed "Where am I" and weather context.
+                        isNeedAddress = true
                         isSensorEnable = true
                     },
                 )
+            } catch (error: Exception) {
+                locationClient.onDestroy()
+                throw error
             }
+            client = locationClient
             true
         } catch (error: Exception) {
             onStatus("Location setup failed: ${error.message ?: "unknown error"}")
@@ -97,6 +103,8 @@ class AmapLocationController(
                 accuracyMeters = accuracy,
                 source = source,
                 confidence = confidence,
+                cityName = location.city.orEmpty(),
+                adCode = location.adCode.orEmpty(),
             ),
         )
         val statusKey = "$source:$confidence:${accuracy?.toInt()}"

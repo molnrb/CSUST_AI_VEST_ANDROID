@@ -27,6 +27,16 @@ data class UserPreferences(
     val speechDetail: SpeechDetail = SpeechDetail.STANDARD,
     val language: AppLanguage = AppLanguage.ENGLISH,
     val extraSpokenPrompts: Boolean = true,
+    // Developer option: start production navigation in AMap's simulated-movement
+    // mode so the full flow can be exercised indoors or on an emulator.
+    val simulateNavigationMovement: Boolean = false,
+    /**
+     * Precise walking guidance: early, prepare and act-now cues with clock
+     * directions, landmarks and drift warnings, spoken by the app. When off, AMap's
+     * own driving-style voice speaks instead. On by default — this is the point of
+     * the product.
+     */
+    val detailedPedestrianGuidance: Boolean = true,
 )
 
 class UserPreferencesStore(context: Context) {
@@ -48,6 +58,8 @@ class UserPreferencesStore(context: Context) {
             AppLanguage.ENGLISH,
         ),
         extraSpokenPrompts = preferences.getBoolean(KEY_EXTRA_PROMPTS, true),
+        simulateNavigationMovement = preferences.getBoolean(KEY_SIMULATE_MOVEMENT, false),
+        detailedPedestrianGuidance = preferences.getBoolean(KEY_DETAILED_GUIDANCE, true),
     )
 
     fun save(value: UserPreferences) {
@@ -58,6 +70,8 @@ class UserPreferencesStore(context: Context) {
             .putString(KEY_SPEECH_DETAIL, value.speechDetail.name)
             .putString(KEY_LANGUAGE, value.language.name)
             .putBoolean(KEY_EXTRA_PROMPTS, value.extraSpokenPrompts)
+            .putBoolean(KEY_SIMULATE_MOVEMENT, value.simulateNavigationMovement)
+            .putBoolean(KEY_DETAILED_GUIDANCE, value.detailedPedestrianGuidance)
             .remove(KEY_NAVIGATION_CONTROL_STYLE)
             .apply()
     }
@@ -77,6 +91,8 @@ class UserPreferencesStore(context: Context) {
         const val KEY_SPEECH_DETAIL = "speech_detail"
         const val KEY_LANGUAGE = "language"
         const val KEY_EXTRA_PROMPTS = "extra_spoken_prompts"
+        const val KEY_SIMULATE_MOVEMENT = "simulate_navigation_movement"
+        const val KEY_DETAILED_GUIDANCE = "detailed_pedestrian_guidance"
         // Kept only to remove values written by older builds.
         const val KEY_NAVIGATION_CONTROL_STYLE = "navigation_control_style"
     }

@@ -19,26 +19,41 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
+import com.csust.soleprecision.accessibility.NarrationPriority
 import com.csust.soleprecision.accessibility.ScreenNarrator
 import com.csust.soleprecision.bluetooth.BleWearableTransport
 import com.csust.soleprecision.bluetooth.MockWearableTransport
 import com.csust.soleprecision.bluetooth.WearableTransport
 import com.csust.soleprecision.device.DeviceTestCommand
 import com.csust.soleprecision.device.HexPacketCodec
+import com.csust.soleprecision.feedback.HapticGuidance
+import com.csust.soleprecision.i18n.GuidancePhrases
+import com.csust.soleprecision.i18n.Phrases
 import com.csust.soleprecision.navigation.AmapInputTipsController
 import com.csust.soleprecision.navigation.AmapLocationController
 import com.csust.soleprecision.navigation.AmapNavigationController
+import com.csust.soleprecision.navigation.AmapNearbySearchController
 import com.csust.soleprecision.navigation.AmapPlaceSearchController
+import com.csust.soleprecision.navigation.AmapReverseGeocodeController
+import com.csust.soleprecision.navigation.AmapWeatherController
+import com.csust.soleprecision.navigation.CueStage
 import com.csust.soleprecision.navigation.DestinationHistoryStore
 import com.csust.soleprecision.navigation.DestinationSearchState
 import com.csust.soleprecision.navigation.DestinationSuggestion
+import com.csust.soleprecision.navigation.FavoriteDestinationsStore
+import com.csust.soleprecision.navigation.LocalWeather
 import com.csust.soleprecision.navigation.Maneuver
 import com.csust.soleprecision.navigation.NavigationInstruction
+import com.csust.soleprecision.navigation.NearbyCategory
 import com.csust.soleprecision.navigation.PlaceCandidate
 import com.csust.soleprecision.navigation.RouteSummary
 import com.csust.soleprecision.navigation.UserLocation
 import com.csust.soleprecision.navigation.WalkingRouteStep
+import com.csust.soleprecision.device.DeviceTestPacketEncoder
+import com.csust.soleprecision.device.OutputSide
+import com.csust.soleprecision.device.VibrationPattern
 import com.csust.soleprecision.settings.GuidanceMode
+import com.csust.soleprecision.settings.SpeechDetail
 import com.csust.soleprecision.settings.UserPreferences
 import com.csust.soleprecision.settings.UserPreferencesStore
 import com.csust.soleprecision.ui.SolePrecisionApp
@@ -61,8 +76,14 @@ class MainActivity : ComponentActivity() {
     private var routeSummary by mutableStateOf<RouteSummary?>(null)
     private var routeOptions by mutableStateOf<List<RouteSummary>>(emptyList())
     private var recentDestinations by mutableStateOf<List<PlaceCandidate>>(emptyList())
+    private var favoriteDestinations by mutableStateOf<List<PlaceCandidate>>(emptyList())
     private var userPreferences by mutableStateOf(UserPreferences())
     private var useMockHardware by mutableStateOf(false)
+    private var speechUnavailable by mutableStateOf(false)
+    private var whereAmIText by mutableStateOf<String?>(null)
+    private var nearbyResults by mutableStateOf<List<PlaceCandidate>?>(null)
+    private var nearbyStatus by mutableStateOf("")
+    private var routeWeather by mutableStateOf<LocalWeather?>(null)
     private var guidancePaused = false
     private var mockRoutePrepared = false
     private var pendingRouteDestination: PlaceCandidate? = null
@@ -72,12 +93,23 @@ class MainActivity : ComponentActivity() {
     private lateinit var locationController: AmapLocationController
     private lateinit var placeSearchController: AmapPlaceSearchController
     private lateinit var inputTipsController: AmapInputTipsController
+    private lateinit var nearbySearchController: AmapNearbySearchController
+    private lateinit var reverseGeocodeController: AmapReverseGeocodeController
+    private lateinit var weatherController: AmapWeatherController
     private lateinit var bleWearableTransport: BleWearableTransport
     private lateinit var mockWearableTransport: MockWearableTransport
     private lateinit var destinationHistoryStore: DestinationHistoryStore
+    private lateinit var favoriteDestinationsStore: FavoriteDestinationsStore
     private lateinit var userPreferencesStore: UserPreferencesStore
     private lateinit var screenNarrator: ScreenNarrator
+    private lateinit var hapticGuidance: HapticGuidance
     private var speechRecognizer: SpeechRecognizer? = null
+
+    private val phrases: Phrases
+        get() = Phrases.forLanguage(userPreferences.language)
+
+    private val guidancePhrases: GuidancePhrases
+        get() = GuidancePhrases.forLanguage(userPreferences.language)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -97,10 +129,16 @@ class MainActivity : ComponentActivity() {
         hasMapConsent = getPreferences(MODE_PRIVATE).getBoolean(MAP_CONSENT_KEY, false)
         destinationHistoryStore = DestinationHistoryStore(this)
         recentDestinations = destinationHistoryStore.load()
+        favoriteDestinationsStore = FavoriteDestinationsStore(this)
+        favoriteDestinations = favoriteDestinationsStore.load()
         userPreferencesStore = UserPreferencesStore(this)
         userPreferences = userPreferencesStore.load()
-        screenNarrator = ScreenNarrator(this)
+        screenNarrator = ScreenNarrator(this) { message ->
+            speechUnavailable = true
+            navigationStatus = message
+        }
         screenNarrator.setLanguage(userPreferences.language.languageTag)
+        screenNarrator.setVolume(userPreferences.speakerVolume)
         useMockHardware = getPreferences(MODE_PRIVATE).getBoolean(
             MOCK_HARDWARE_KEY,
             isProbablyEmulator(),
@@ -120,12 +158,15 @@ class MainActivity : ComponentActivity() {
             mockWearableTransport.connect()
             activateMockLocation()
         }
+        hapticGuidance = HapticGuidance(this)
+        reverseGeocodeController = AmapReverseGeocodeController(this)
         navigationController = AmapNavigationController(
             context = this,
             onInstruction = ::handleInstruction,
             onStatus = { navigationStatus = it },
             onRouteReady = { routeSummary = it },
             onRoutesReady = { routeOptions = it },
+            landmarkResolver = ::resolveLandmark,
         )
         locationController = AmapLocationController(
             context = this,
@@ -134,6 +175,8 @@ class MainActivity : ComponentActivity() {
         )
         placeSearchController = AmapPlaceSearchController(this)
         inputTipsController = AmapInputTipsController(this)
+        nearbySearchController = AmapNearbySearchController(this)
+        weatherController = AmapWeatherController(this)
         initializeSpeechRecognizer()
 
         if (hasMapConsent && hasLocationPermission()) {
@@ -157,8 +200,14 @@ class MainActivity : ComponentActivity() {
                 routeSummary = routeSummary,
                 routeOptions = routeOptions,
                 recentDestinations = recentDestinations,
+                favoriteDestinations = favoriteDestinations,
                 userPreferences = userPreferences,
                 useMockHardware = useMockHardware,
+                speechUnavailable = speechUnavailable,
+                whereAmIText = whereAmIText,
+                nearbyResults = nearbyResults,
+                nearbyStatus = nearbyStatus,
+                routeWeather = routeWeather,
                 onAcceptMapPrivacy = ::acceptMapPrivacy,
                 onRequestPermissions = ::requestRuntimePermissions,
                 onConnectWearable = ::connectWearable,
@@ -182,8 +231,41 @@ class MainActivity : ComponentActivity() {
                 onResumeGuidance = ::resumeGuidance,
                 onSavePreferences = ::savePreferences,
                 onClearHistory = ::clearDestinationHistory,
-                onAnnounceScreen = screenNarrator::speak,
+                onAnnounceScreen = ::announce,
+                onAnnounceActions = ::announceActions,
+                onWhereAmI = ::requestWhereAmI,
+                onSaveFavorite = ::saveFavorite,
+                onRemoveFavorite = ::removeFavorite,
+                onNearbySearch = ::searchNearby,
+                onClearNearby = ::clearNearby,
             )
+        }
+    }
+
+    private fun announce(message: String) {
+        screenNarrator.speak(message, NarrationPriority.HIGH)
+    }
+
+    /**
+     * Action lists are queued behind the screen context so the user hears
+     * "where am I and what is here" before "what can I do".
+     */
+    private fun announceActions(message: String) {
+        screenNarrator.speak(message, NarrationPriority.NORMAL)
+    }
+
+    /** One-shot nearest-place lookup used to anchor turn cues to a landmark. */
+    private fun resolveLandmark(
+        latitude: Double,
+        longitude: Double,
+        onResolved: (String) -> Unit,
+    ) {
+        if (useMockHardware) {
+            onResolved("")
+            return
+        }
+        reverseGeocodeController.resolve(latitude, longitude) { result ->
+            onResolved(result.getOrNull()?.nearestPoiName.orEmpty())
         }
     }
 
@@ -193,7 +275,9 @@ class MainActivity : ComponentActivity() {
         placeSearchController.initializeAfterConsent()
         placeSearchController.setLanguage(userPreferences.language.languageTag)
         inputTipsController.initializeAfterConsent()
-        navigationController.setVoiceEnabled(userPreferences.guidanceMode != GuidanceMode.HAPTIC_ONLY)
+        nearbySearchController.initializeAfterConsent()
+        weatherController.initializeAfterConsent()
+        applyVoiceOwnership()
         if (useMockHardware) {
             activateMockLocation()
         } else {
@@ -258,17 +342,13 @@ class MainActivity : ComponentActivity() {
             ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
-            destinationSearchState = DestinationSearchState.Error(
-                "Microphone permission is required. Allow it, then tap the microphone again.",
-            )
+            destinationSearchState = DestinationSearchState.Error(phrases.micPermissionNeeded)
             requestRuntimePermissions()
             return
         }
         val recognizer = speechRecognizer
         if (recognizer == null) {
-            destinationSearchState = DestinationSearchState.Error(
-                "No speech recognition service is available on this device.",
-            )
+            destinationSearchState = DestinationSearchState.Error(phrases.noSpeechService)
             return
         }
         destinationSearchState = DestinationSearchState.Listening
@@ -277,7 +357,7 @@ class MainActivity : ComponentActivity() {
                 RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                 RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
             )
-            putExtra(RecognizerIntent.EXTRA_PROMPT, "Say your destination")
+            putExtra(RecognizerIntent.EXTRA_PROMPT, phrases.sayDestinationPrompt)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, userPreferences.language.languageTag)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
@@ -306,13 +386,13 @@ class MainActivity : ComponentActivity() {
                             when (error) {
                                 SpeechRecognizer.ERROR_NO_MATCH,
                                 SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
-                                -> "No destination was recognized. Tap the microphone and try again."
+                                -> phrases.noDestinationRecognized
                                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
-                                    "Microphone permission is required for voice destination."
+                                    phrases.micPermissionForVoice
                                 SpeechRecognizer.ERROR_NETWORK,
                                 SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
-                                -> "Voice recognition needs a working network connection."
-                                else -> "Voice recognition stopped. Tap the microphone to try again."
+                                -> phrases.voiceNeedsNetwork
+                                else -> phrases.voiceStopped
                             },
                         )
                     }
@@ -324,7 +404,7 @@ class MainActivity : ComponentActivity() {
                             ?.firstOrNull()
                         if (spokenText.isNullOrBlank()) {
                             destinationSearchState = DestinationSearchState.Error(
-                                "No destination was recognized. Tap the microphone and try again.",
+                                phrases.noDestinationRecognized,
                             )
                         } else {
                             searchDestination(spokenText)
@@ -356,7 +436,7 @@ class MainActivity : ComponentActivity() {
         val cleanQuery = query.trim()
         if (cleanQuery.isBlank()) {
             destinationSearchState = DestinationSearchState.Error(
-                "Say or enter a destination first.",
+                phrases.sayOrEnterDestinationFirst,
             )
             return
         }
@@ -372,7 +452,7 @@ class MainActivity : ComponentActivity() {
                 destinationSearchState = DestinationSearchState.Results(cleanQuery, places)
             }.onFailure { error ->
                 destinationSearchState = DestinationSearchState.Error(
-                    error.message ?: "Destination search failed",
+                    phrases.statusText(error.message ?: "Destination search failed"),
                 )
             }
         }
@@ -415,6 +495,7 @@ class MainActivity : ComponentActivity() {
         routeSummary = null
         routeOptions = emptyList()
         currentInstruction = null
+        fetchRouteWeather()
         if (useMockHardware) {
             pendingRouteDestination = null
             prepareMockRoute(destination)
@@ -422,10 +503,31 @@ class MainActivity : ComponentActivity() {
         }
         val location = currentLocation
         if (location == null) {
-            locationStatus = "Finding current location for the route…"
+            locationStatus = "Finding current location…"
             locationController.refresh()
         } else {
             requestRoute(location, destination)
+        }
+    }
+
+    private fun fetchRouteWeather() {
+        routeWeather = null
+        if (useMockHardware) {
+            routeWeather = LocalWeather(
+                description = "晴",
+                temperatureCelsius = "24",
+                windDirection = "东北",
+                windPower = "3",
+                humidityPercent = "60",
+                reportTime = "",
+            )
+            return
+        }
+        val location = currentLocation ?: return
+        val city = location.adCode.ifBlank { location.cityName }
+        if (city.isBlank()) return
+        weatherController.fetchLiveWeather(city) { result ->
+            result.onSuccess { routeWeather = it }
         }
     }
 
@@ -443,6 +545,7 @@ class MainActivity : ComponentActivity() {
             startLatitude = location.latitude,
             startLongitude = location.longitude,
             destination = destination,
+            simulateMovement = userPreferences.simulateNavigationMovement,
         )
     }
 
@@ -473,15 +576,29 @@ class MainActivity : ComponentActivity() {
     private fun pauseGuidance() {
         guidancePaused = true
         navigationController.setVoiceEnabled(false)
+        screenNarrator.stopSpeaking()
+        hapticGuidance.stop()
         navigationStatus =
             "Phone route guidance paused; the current app does not verify nearby obstacles"
     }
 
     private fun resumeGuidance() {
         guidancePaused = false
-        navigationController.setVoiceEnabled(userPreferences.guidanceMode != GuidanceMode.HAPTIC_ONLY)
+        applyVoiceOwnership()
         repeatCurrentInstruction()
         navigationStatus = "Navigation guidance resumed"
+    }
+
+    /**
+     * Exactly one voice owns route guidance. With detailed pedestrian guidance on,
+     * the app speaks precise walking cues and AMap's driving-style voice is muted;
+     * with it off, AMap's native voice speaks and the app stays quiet.
+     */
+    private fun applyVoiceOwnership() {
+        val appSpeaks = userPreferences.detailedPedestrianGuidance
+        val speechAllowed = !guidancePaused &&
+            userPreferences.guidanceMode != GuidanceMode.HAPTIC_ONLY
+        navigationController.setVoiceEnabled(speechAllowed && !appSpeaks)
     }
 
     private fun stopNavigation() {
@@ -493,21 +610,152 @@ class MainActivity : ComponentActivity() {
         activeDestination = null
         pendingRouteDestination = null
         mockRoutePrepared = false
+        routeWeather = null
+        weatherController.cancel()
     }
 
     private fun savePreferences(value: UserPreferences) {
         userPreferences = value
         userPreferencesStore.save(value)
         screenNarrator.setLanguage(value.language.languageTag)
+        screenNarrator.setVolume(value.speakerVolume)
         placeSearchController.setLanguage(value.language.languageTag)
-        navigationController.setVoiceEnabled(
-            !guidancePaused && value.guidanceMode != GuidanceMode.HAPTIC_ONLY,
-        )
+        applyVoiceOwnership()
     }
 
     private fun clearDestinationHistory() {
         destinationHistoryStore.clear()
         recentDestinations = emptyList()
+    }
+
+    private fun saveFavorite(place: PlaceCandidate) {
+        favoriteDestinations = favoriteDestinationsStore.add(place)
+        announce(phrases.placeSaved)
+    }
+
+    private fun removeFavorite(place: PlaceCandidate) {
+        favoriteDestinations = favoriteDestinationsStore.remove(place)
+        announce(phrases.removedFromSaved)
+    }
+
+    private fun requestWhereAmI() {
+        val currentPhrases = phrases
+        val location = currentLocation
+        if (location == null) {
+            whereAmIText = currentPhrases.whereAmIUnavailable
+            if (!useMockHardware) locationController.refresh()
+            return
+        }
+        whereAmIText = currentPhrases.whereAmIWorking
+        if (useMockHardware) {
+            whereAmIText = composeWhereAmI(
+                currentPhrases,
+                address = location.address,
+                nearestPoi = "",
+                accuracyMeters = location.accuracyMeters,
+            )
+            return
+        }
+        reverseGeocodeController.resolve(location.latitude, location.longitude) { result ->
+            result.onSuccess { resolved ->
+                whereAmIText = composeWhereAmI(
+                    currentPhrases,
+                    address = resolved.address,
+                    nearestPoi = resolved.name.takeIf { it != resolved.address }.orEmpty(),
+                    accuracyMeters = location.accuracyMeters,
+                )
+            }.onFailure {
+                whereAmIText = composeWhereAmI(
+                    currentPhrases,
+                    address = location.address.ifBlank { currentPhrases.whereAmIUnavailable },
+                    nearestPoi = "",
+                    accuracyMeters = location.accuracyMeters,
+                )
+            }
+        }
+    }
+
+    private fun composeWhereAmI(
+        currentPhrases: Phrases,
+        address: String,
+        nearestPoi: String,
+        accuracyMeters: Float?,
+    ): String = buildList {
+        add(address)
+        if (nearestPoi.isNotBlank()) {
+            add(currentPhrases.whereAmINearestPoi.format(nearestPoi))
+        }
+        accuracyMeters?.let { add(currentPhrases.whereAmIAccuracy.format(it.toInt())) }
+        add(currentPhrases.whereAmICaution)
+    }.joinToString(separator = ". ")
+
+    private fun searchNearby(category: NearbyCategory) {
+        val currentPhrases = phrases
+        nearbyResults = null
+        nearbyStatus = currentPhrases.nearbySearching.format(
+            currentPhrases.nearbyCategoryLabel(category),
+        )
+        if (useMockHardware) {
+            nearbyResults = mockNearbyResults(category)
+            nearbyStatus = ""
+            return
+        }
+        val location = currentLocation
+        if (location == null) {
+            nearbyResults = emptyList()
+            nearbyStatus = currentPhrases.whereAmIUnavailable
+            locationController.refresh()
+            return
+        }
+        nearbySearchController.search(
+            category = category,
+            latitude = location.latitude,
+            longitude = location.longitude,
+        ) { result ->
+            result.onSuccess { places ->
+                nearbyResults = places
+                nearbyStatus = if (places.isEmpty()) {
+                    currentPhrases.nearbyNoResults.format(
+                        currentPhrases.nearbyCategoryLabel(category),
+                    )
+                } else {
+                    ""
+                }
+            }.onFailure { error ->
+                nearbyResults = emptyList()
+                nearbyStatus = currentPhrases.statusText(
+                    error.message ?: "AMap nearby search failed",
+                )
+            }
+        }
+    }
+
+    private fun clearNearby() {
+        nearbySearchController.cancel()
+        nearbyResults = null
+        nearbyStatus = ""
+    }
+
+    private fun mockNearbyResults(category: NearbyCategory): List<PlaceCandidate> {
+        val label = phrases.nearbyCategoryLabel(category)
+        return listOf(
+            PlaceCandidate(
+                id = "mock-nearby-1-${category.name}",
+                name = "$label 1",
+                address = "Simulated result near the mock position",
+                area = "Changsha",
+                latitude = MOCK_LATITUDE + 0.001,
+                longitude = MOCK_LONGITUDE + 0.001,
+            ),
+            PlaceCandidate(
+                id = "mock-nearby-2-${category.name}",
+                name = "$label 2",
+                address = "Second simulated result",
+                area = "Changsha",
+                latitude = MOCK_LATITUDE - 0.002,
+                longitude = MOCK_LONGITUDE + 0.002,
+            ),
+        )
     }
 
     private fun sendDemoInstruction(maneuver: Maneuver, distanceMeters: Int) {
@@ -535,7 +783,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (sent && useMockHardware) {
-            screenNarrator.speak("Simulation. ${command.description()}.")
+            screenNarrator.speak("Simulation. ${command.description()}.", NarrationPriority.NORMAL)
         }
     }
 
@@ -560,16 +808,103 @@ class MainActivity : ComponentActivity() {
         currentInstruction = instruction
         if (guidancePaused) return
 
+        speakGuidance(instruction)
         val sent = activeWearableTransport.send(instruction)
         navigationStatus = if (sent) {
             if (useMockHardware) {
-                "${instruction.message}; executed by simulated backpack"
+                "Instruction executed by simulated backpack"
             } else {
-                "${instruction.message}; sent to wearable"
+                "Instruction sent to wearable"
             }
         } else {
-            "${instruction.message}; packet prepared, wearable offline"
+            "Instruction prepared, wearable offline"
         }
+    }
+
+    /**
+     * Speaks a live guidance cue and fires the matching directional haptics.
+     * Urgency maps to narration priority so an act-now cue can interrupt chatter
+     * but nothing can interrupt it.
+     */
+    private fun speakGuidance(instruction: NavigationInstruction) {
+        val cue = instruction.cue
+        val mode = userPreferences.guidanceMode
+        if (cue == null) {
+            if (mode != GuidanceMode.HAPTIC_ONLY) {
+                screenNarrator.speak(
+                    phrases.instructionMessage(instruction),
+                    NarrationPriority.HIGH,
+                )
+            }
+            return
+        }
+
+        if (mode != GuidanceMode.SPEECH_ONLY) {
+            hapticGuidance.cue(cue, userPreferences.vibrationStrength)
+            sendDirectionalWearableCue(cue)
+        }
+        if (mode == GuidanceMode.HAPTIC_ONLY) return
+        if (!shouldSpeak(cue.stage, userPreferences.speechDetail)) return
+        if (!userPreferences.detailedPedestrianGuidance) return
+
+        val priority = when (cue.stage) {
+            CueStage.ACT,
+            CueStage.OFF_ROUTE,
+            CueStage.ARRIVAL,
+            -> NarrationPriority.CRITICAL
+
+            CueStage.PREPARE -> NarrationPriority.HIGH
+            CueStage.EARLY,
+            CueStage.CONFIRM,
+            CueStage.PROGRESS,
+            -> NarrationPriority.NORMAL
+        }
+        screenNarrator.speak(
+            guidancePhrases.cueMessage(cue, userPreferences.speechDetail, phrases),
+            priority,
+        )
+    }
+
+    /** Speech density by detail level; safety stages are never filtered out. */
+    private fun shouldSpeak(stage: CueStage, detail: SpeechDetail): Boolean = when (stage) {
+        CueStage.ACT,
+        CueStage.PREPARE,
+        CueStage.OFF_ROUTE,
+        CueStage.ARRIVAL,
+        -> true
+
+        CueStage.EARLY,
+        CueStage.CONFIRM,
+        -> detail != SpeechDetail.CONCISE
+
+        CueStage.PROGRESS -> detail == SpeechDetail.DETAILED
+    }
+
+    /**
+     * Left/right buzz on the wearable at the moment of action, using the existing
+     * temporary vibration packet type — the same thing the ESP32 will do for real.
+     */
+    private fun sendDirectionalWearableCue(cue: com.csust.soleprecision.navigation.GuidanceCue) {
+        if (cue.stage != CueStage.ACT) return
+        val side = when (cue.side) {
+            com.csust.soleprecision.navigation.TurnSide.LEFT -> OutputSide.LEFT
+            com.csust.soleprecision.navigation.TurnSide.RIGHT -> OutputSide.RIGHT
+            com.csust.soleprecision.navigation.TurnSide.NONE ->
+                if (cue.isHazardManeuver) OutputSide.BOTH else return
+        }
+        activeWearableTransport.send(
+            DeviceTestCommand.Vibration(
+                side = side,
+                intensityPercent = userPreferences.vibrationStrength,
+                durationMs = if (cue.isHazardManeuver) 250 else 400,
+                pattern = if (cue.isHazardManeuver) {
+                    VibrationPattern.TRIPLE_PULSE
+                } else {
+                    VibrationPattern.DOUBLE_PULSE
+                },
+                repeatCount = 1,
+            ),
+        )
     }
 
     private fun activateMockLocation() {
@@ -578,6 +913,8 @@ class MainActivity : ComponentActivity() {
             longitude = MOCK_LONGITUDE,
             address = "Simulated GPS position in Changsha",
             cityCode = "0731",
+            cityName = "长沙市",
+            adCode = "430100",
         )
         currentLocation = location
         locationStatus = "Using simulated upper-controller GPS in Changsha"
@@ -639,10 +976,23 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun repeatCurrentInstruction() {
+        val cueInstruction = navigationController.repeatCurrentCue()
+        if (cueInstruction != null && userPreferences.detailedPedestrianGuidance) {
+            currentInstruction = cueInstruction
+            cueInstruction.cue?.let { cue ->
+                screenNarrator.speak(
+                    guidancePhrases.cueMessage(cue, userPreferences.speechDetail, phrases),
+                    NarrationPriority.HIGH,
+                )
+            }
+            return
+        }
         val instruction = currentInstruction ?: return
-        if (useMockHardware) {
-            handleInstruction(instruction)
-            screenNarrator.speak(instruction.message)
+        if (useMockHardware || userPreferences.detailedPedestrianGuidance) {
+            screenNarrator.speak(
+                phrases.instructionMessage(instruction),
+                NarrationPriority.HIGH,
+            )
         } else {
             navigationController.repeatCurrentInstruction()
         }
@@ -657,12 +1007,19 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         mainHandler.removeCallbacksAndMessages(null)
         screenNarrator.close()
+        hapticGuidance.stop()
         locationController.close()
         placeSearchController.cancel()
         inputTipsController.cancel()
-        speechRecognizer?.cancel()
-        speechRecognizer?.destroy()
-        speechRecognizer = null
+        nearbySearchController.cancel()
+        reverseGeocodeController.cancel()
+        weatherController.cancel()
+        try {
+            speechRecognizer?.cancel()
+        } finally {
+            speechRecognizer?.destroy()
+            speechRecognizer = null
+        }
         navigationController.close()
         bleWearableTransport.close()
         mockWearableTransport.close()

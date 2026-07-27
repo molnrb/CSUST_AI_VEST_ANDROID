@@ -6,16 +6,15 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -26,8 +25,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -53,10 +52,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.csust.soleprecision.device.AudioCue
-import com.csust.soleprecision.device.DeviceTestCommand
-import com.csust.soleprecision.device.OutputSide
-import com.csust.soleprecision.device.VibrationPattern
 import com.amap.api.maps.CameraUpdateFactory
 import com.amap.api.maps.MapsInitializer
 import com.amap.api.maps.TextureMapView
@@ -65,11 +60,20 @@ import com.amap.api.maps.model.MarkerOptions
 import com.amap.api.maps.model.MyLocationStyle
 import com.amap.api.navi.AMapNaviView
 import com.amap.api.navi.AMapNaviViewOptions
+import com.csust.soleprecision.device.AudioCue
+import com.csust.soleprecision.device.DeviceTestCommand
+import com.csust.soleprecision.device.OutputSide
+import com.csust.soleprecision.device.VibrationPattern
+import com.csust.soleprecision.i18n.GuidancePhrases
+import com.csust.soleprecision.i18n.Phrases
+import com.csust.soleprecision.navigation.CueStage
 import com.csust.soleprecision.navigation.DestinationSearchState
 import com.csust.soleprecision.navigation.DestinationSuggestion
+import com.csust.soleprecision.navigation.LocalWeather
 import com.csust.soleprecision.navigation.Maneuver
 import com.csust.soleprecision.navigation.NavigationInstruction
 import com.csust.soleprecision.navigation.AmapReverseGeocodeController
+import com.csust.soleprecision.navigation.NearbyCategory
 import com.csust.soleprecision.navigation.PlaceCandidate
 import com.csust.soleprecision.navigation.ResolvedMapAddress
 import com.csust.soleprecision.navigation.RouteSummary
@@ -78,33 +82,21 @@ import com.csust.soleprecision.settings.AppLanguage
 import com.csust.soleprecision.settings.GuidanceMode
 import com.csust.soleprecision.settings.SpeechDetail
 import com.csust.soleprecision.settings.UserPreferences
-import kotlin.math.atan2
-import kotlin.math.cos
-import kotlin.math.sin
-import kotlin.math.sqrt
 import kotlinx.coroutines.delay
 
-private val ProductionColors = darkColorScheme(
-    primary = Color(0xFFFFD54F),
-    onPrimary = Color.Black,
-    background = Color.Black,
-    onBackground = Color.White,
-    surface = Color(0xFF151515),
-    onSurface = Color.White,
-    surfaceVariant = Color(0xFF2A2A2A),
-    onSurfaceVariant = Color.White,
-    error = Color(0xFFFF6B6B),
-)
-
-private enum class ProductionScreen {
+internal enum class ProductionScreen {
     HOME,
+    WHERE_AM_I,
     DESTINATION,
     DESTINATION_METHODS,
     DESTINATION_COLLECTIONS,
+    NEARBY_CATEGORIES,
+    NEARBY_RESULTS,
     VOICE_DESTINATION,
     TYPE_DESTINATION,
     MAP_DESTINATION,
     RECENT_PLACES,
+    SAVED_PLACES,
     SEARCHING,
     SEARCH_RESULTS,
     CONFIRM_PLACE,
@@ -135,8 +127,14 @@ fun SolePrecisionApp(
     routeSummary: RouteSummary?,
     routeOptions: List<RouteSummary>,
     recentDestinations: List<PlaceCandidate>,
+    favoriteDestinations: List<PlaceCandidate>,
     userPreferences: UserPreferences,
     useMockHardware: Boolean,
+    speechUnavailable: Boolean,
+    whereAmIText: String?,
+    nearbyResults: List<PlaceCandidate>?,
+    nearbyStatus: String,
+    routeWeather: LocalWeather?,
     onAcceptMapPrivacy: () -> Unit,
     onRequestPermissions: () -> Unit,
     onConnectWearable: () -> Unit,
@@ -159,21 +157,48 @@ fun SolePrecisionApp(
     onPauseGuidance: () -> Unit,
     onResumeGuidance: () -> Unit,
     onAnnounceScreen: (String) -> Unit,
+    onAnnounceActions: (String) -> Unit,
     onSavePreferences: (UserPreferences) -> Unit,
     onClearHistory: () -> Unit,
+    onWhereAmI: () -> Unit,
+    onSaveFavorite: (PlaceCandidate) -> Unit,
+    onRemoveFavorite: (PlaceCandidate) -> Unit,
+    onNearbySearch: (NearbyCategory) -> Unit,
+    onClearNearby: () -> Unit,
 ) {
-    MaterialTheme(colorScheme = ProductionColors) {
+    val p = remember(userPreferences.language) {
+        Phrases.forLanguage(userPreferences.language)
+    }
+    val guidancePhrases = remember(userPreferences.language) {
+        GuidancePhrases.forLanguage(userPreferences.language)
+    }
+    val announceActions: (ScreenActions) -> Unit = { screenActions ->
+        if (userPreferences.extraSpokenPrompts) {
+            onAnnounceActions(
+                guidancePhrases.actionsSentence(
+                    title = screenActions.title,
+                    right = screenActions.right,
+                    left = screenActions.left,
+                    up = screenActions.up,
+                    down = screenActions.down,
+                    usesButtons = screenActions.usesButtons,
+                ),
+            )
+        }
+    }
+    CompositionLocalProvider(LocalActionAnnouncer provides announceActions) {
+    MaterialTheme(
+        colorScheme = ProductionColorScheme,
+        typography = ProductionTypography,
+    ) {
         Surface(modifier = Modifier.fillMaxSize()) {
             if (!hasMapConsent) {
                 LaunchedEffect(userPreferences.extraSpokenPrompts) {
                     if (userPreferences.extraSpokenPrompts) {
-                        onAnnounceScreen(
-                            "AMap navigation consent. Review the location and data notice. " +
-                                "I agree and continue is the main button.",
-                        )
+                        onAnnounceScreen(p.introConsent)
                     }
                 }
-                MapPrivacyScreen(onAccept = onAcceptMapPrivacy)
+                LocalizedMapPrivacyScreen(p = p, onAccept = onAcceptMapPrivacy)
             } else {
                 var screen by rememberSaveable { mutableStateOf(ProductionScreen.HOME) }
                 var selectedPlace by remember { mutableStateOf<PlaceCandidate?>(null) }
@@ -193,13 +218,21 @@ fun SolePrecisionApp(
                     routeOptions,
                     userPreferences.extraSpokenPrompts,
                 ) {
-                    if (userPreferences.extraSpokenPrompts) {
+                    // During real navigation the AMap voice owns route audio; the app
+                    // narrator stays silent so two voices never overlap.
+                    val narratorOwnsScreen =
+                        screen != ProductionScreen.ACTIVE_NAVIGATION || useMockHardware
+                    if (userPreferences.extraSpokenPrompts && narratorOwnsScreen) {
                         onAnnounceScreen(
-                            screen.spokenIntroduction(
+                            screenIntroduction(
+                                screen = screen,
+                                phrases = p,
+                                detail = userPreferences.speechDetail,
                                 place = selectedPlace,
                                 routeSummary = routeSummary,
-                                isSimulation = useMockHardware,
-                                useDirectionalLayout = true,
+                                isSimulation = useMockHardware ||
+                                    userPreferences.simulateNavigationMovement,
+                                weather = routeWeather,
                             ),
                         )
                     }
@@ -271,49 +304,85 @@ fun SolePrecisionApp(
                             screen = ProductionScreen.HOME
                         }
 
+                        ProductionScreen.NEARBY_RESULTS -> {
+                            onClearNearby()
+                            screen = ProductionScreen.NEARBY_CATEGORIES
+                        }
+
                         else -> screen = screen.backDestination()
                     }
                 }
 
                 when (screen) {
                     ProductionScreen.HOME -> HomeScreen(
+                        p = p,
                         wearableStatus = wearableStatus,
                         currentLocation = currentLocation,
                         locationStatus = locationStatus,
-                        useDirectionalLayout = true,
+                        speechUnavailable = speechUnavailable,
                         onNavigation = { screen = ProductionScreen.DESTINATION },
                         onSettings = { screen = ProductionScreen.SETTINGS },
+                        onWhereAmI = { screen = ProductionScreen.WHERE_AM_I },
                     )
 
-                    ProductionScreen.DESTINATION -> DestinationScreen(
-                        showNavigationDemo = useMockHardware,
-                        useDirectionalLayout = true,
+                    ProductionScreen.WHERE_AM_I -> WhereAmIScreen(
+                        p = p,
+                        text = whereAmIText,
+                        onRefresh = onWhereAmI,
+                        onAnnounce = onAnnounceScreen,
                         onBack = { screen = ProductionScreen.HOME },
-                        onSpeak = onSpeakDestination,
-                        onType = { screen = ProductionScreen.TYPE_DESTINATION },
-                        onMap = { screen = ProductionScreen.MAP_DESTINATION },
-                        onRecent = { screen = ProductionScreen.RECENT_PLACES },
+                    )
+
+                    ProductionScreen.DESTINATION -> DirectionalDestinationScreen(
+                        p = p,
+                        onBack = { screen = ProductionScreen.HOME },
                         onMore = { screen = ProductionScreen.DESTINATION_METHODS },
                         onCollections = { screen = ProductionScreen.DESTINATION_COLLECTIONS },
-                        onDemo = {
-                            selectedPlace = SimulatedDestination
-                            screen = ProductionScreen.CONFIRM_PLACE
-                        },
+                        onNearby = { screen = ProductionScreen.NEARBY_CATEGORIES },
                     )
 
                     ProductionScreen.DESTINATION_METHODS -> DestinationMethodsScreen(
+                        p = p,
                         onBack = { screen = ProductionScreen.DESTINATION },
                         onSearchMap = { screen = ProductionScreen.MAP_DESTINATION },
                         onVoice = { screen = ProductionScreen.VOICE_DESTINATION },
                     )
 
                     ProductionScreen.DESTINATION_COLLECTIONS -> DestinationCollectionsScreen(
+                        p = p,
                         onBack = { screen = ProductionScreen.DESTINATION },
-                        onSaved = { screen = ProductionScreen.RECENT_PLACES },
+                        onSaved = { screen = ProductionScreen.SAVED_PLACES },
                         onRecent = { screen = ProductionScreen.RECENT_PLACES },
                     )
 
+                    ProductionScreen.NEARBY_CATEGORIES -> NearbyCategoriesScreen(
+                        p = p,
+                        onAnnounce = onAnnounceScreen,
+                        onBack = { screen = ProductionScreen.DESTINATION },
+                        onSearch = { category ->
+                            onNearbySearch(category)
+                            screen = ProductionScreen.NEARBY_RESULTS
+                        },
+                    )
+
+                    ProductionScreen.NEARBY_RESULTS -> NearbyResultsScreen(
+                        p = p,
+                        results = nearbyResults,
+                        status = nearbyStatus,
+                        currentLocation = currentLocation,
+                        onAnnounce = onAnnounceScreen,
+                        onBack = {
+                            onClearNearby()
+                            screen = ProductionScreen.NEARBY_CATEGORIES
+                        },
+                        onSelect = {
+                            selectedPlace = it
+                            screen = ProductionScreen.CONFIRM_PLACE
+                        },
+                    )
+
                     ProductionScreen.VOICE_DESTINATION -> VoiceDestinationScreen(
+                        p = p,
                         state = destinationSearchState,
                         onBack = {
                             onClearDestinationSearch()
@@ -323,10 +392,10 @@ fun SolePrecisionApp(
                     )
 
                     ProductionScreen.TYPE_DESTINATION -> TypeDestinationScreen(
+                        p = p,
                         value = typedDestination,
                         onValueChange = { typedDestination = it },
                         suggestions = destinationSuggestions,
-                        useDirectionalLayout = true,
                         onBack = { screen = ProductionScreen.DESTINATION },
                         onSearch = { onSearchDestination(typedDestination) },
                         onRequestSuggestions = onRequestDestinationSuggestions,
@@ -337,6 +406,7 @@ fun SolePrecisionApp(
                     )
 
                     ProductionScreen.MAP_DESTINATION -> MapDestinationScreen(
+                        p = p,
                         currentLocation = currentLocation,
                         query = typedDestination,
                         onQueryChange = { typedDestination = it },
@@ -351,11 +421,32 @@ fun SolePrecisionApp(
                         },
                     )
 
-                    ProductionScreen.RECENT_PLACES -> RecentPlacesScreen(
+                    ProductionScreen.RECENT_PLACES -> PlaceListScreen(
+                        p = p,
+                        title = p.recentDestinations,
                         places = recentDestinations,
-                        useDirectionalLayout = true,
+                        emptyText = p.noRecentDestinations,
+                        announcementTemplate = p.recentItemAnnouncement,
+                        allowRemove = false,
                         onAnnounce = onAnnounceScreen,
                         onBack = { screen = ProductionScreen.DESTINATION },
+                        onRemove = {},
+                        onSelect = {
+                            selectedPlace = it
+                            screen = ProductionScreen.CONFIRM_PLACE
+                        },
+                    )
+
+                    ProductionScreen.SAVED_PLACES -> PlaceListScreen(
+                        p = p,
+                        title = p.savedDestinations,
+                        places = favoriteDestinations,
+                        emptyText = p.noSavedDestinations,
+                        announcementTemplate = p.savedItemAnnouncement,
+                        allowRemove = true,
+                        onAnnounce = onAnnounceScreen,
+                        onBack = { screen = ProductionScreen.DESTINATION_COLLECTIONS },
+                        onRemove = onRemoveFavorite,
                         onSelect = {
                             selectedPlace = it
                             screen = ProductionScreen.CONFIRM_PLACE
@@ -363,8 +454,8 @@ fun SolePrecisionApp(
                     )
 
                     ProductionScreen.SEARCHING -> SearchStatusScreen(
+                        p = p,
                         state = destinationSearchState,
-                        useDirectionalLayout = true,
                         onBack = {
                             onClearDestinationSearch()
                             screen = ProductionScreen.DESTINATION
@@ -374,10 +465,11 @@ fun SolePrecisionApp(
                     )
 
                     ProductionScreen.SEARCH_RESULTS -> SearchResultsScreen(
+                        p = p,
                         state = destinationSearchState,
                         currentLocation = currentLocation,
+                        speechDetail = userPreferences.speechDetail,
                         onAnnounce = onAnnounceScreen,
-                        useDirectionalLayout = true,
                         onBack = {
                             onClearDestinationSearch()
                             screen = ProductionScreen.DESTINATION
@@ -390,8 +482,12 @@ fun SolePrecisionApp(
 
                     ProductionScreen.CONFIRM_PLACE -> selectedPlace?.let { place ->
                         ConfirmPlaceScreen(
+                            p = p,
                             place = place,
-                            useDirectionalLayout = true,
+                            isSaved = favoriteDestinations.any {
+                                it.id.ifBlank { "${it.latitude}:${it.longitude}" } ==
+                                    place.id.ifBlank { "${place.latitude}:${place.longitude}" }
+                            },
                             onBack = { screen = ProductionScreen.DESTINATION },
                             onConfirm = {
                                 onPlanRoute(place)
@@ -401,12 +497,14 @@ fun SolePrecisionApp(
                                 selectedPlace = null
                                 screen = ProductionScreen.DESTINATION
                             },
+                            onSave = { onSaveFavorite(place) },
                         )
                     } ?: run {
                         screen = ProductionScreen.DESTINATION
                     }
 
                     ProductionScreen.ROUTE_OPTIONS -> RouteOptionsScreen(
+                        p = p,
                         routes = routeOptions,
                         status = navigationStatus,
                         locationStatus = locationStatus,
@@ -424,13 +522,15 @@ fun SolePrecisionApp(
                     )
 
                     ProductionScreen.ROUTE_PREVIEW -> RoutePreviewScreen(
+                        p = p,
                         place = selectedPlace,
                         summary = routeSummary,
                         status = navigationStatus,
                         locationStatus = locationStatus,
                         currentLocation = currentLocation,
                         isSimulation = useMockHardware,
-                        useDirectionalLayout = true,
+                        isMovementSimulated = userPreferences.simulateNavigationMovement,
+                        weather = routeWeather,
                         onBack = {
                             onStopNavigation()
                             screen = ProductionScreen.CONFIRM_PLACE
@@ -444,17 +544,23 @@ fun SolePrecisionApp(
                     )
 
                     ProductionScreen.ROUTE_WALKTHROUGH -> RouteWalkthroughScreen(
+                        p = p,
                         summary = routeSummary,
+                        speechDetail = userPreferences.speechDetail,
                         onAnnounce = onAnnounceScreen,
                         onBack = { screen = ProductionScreen.ROUTE_PREVIEW },
                     )
 
                     ProductionScreen.ACTIVE_NAVIGATION -> ActiveNavigationScreen(
+                        p = p,
+                        guidancePhrases = guidancePhrases,
+                        speechDetail = userPreferences.speechDetail,
                         instruction = instruction,
                         navigationStatus = navigationStatus,
                         wearableStatus = wearableStatus,
                         routeSummary = routeSummary,
                         naviView = nativeNavigationView,
+                        onAnnounce = onAnnounceScreen,
                         onRepeat = onRepeatInstruction,
                         onPause = {
                             onPauseGuidance()
@@ -463,6 +569,7 @@ fun SolePrecisionApp(
                     )
 
                     ProductionScreen.PAUSED -> PausedScreen(
+                        p = p,
                         instruction = instruction,
                         naviView = nativeNavigationView,
                         onContinue = {
@@ -476,8 +583,8 @@ fun SolePrecisionApp(
                     )
 
                     ProductionScreen.ARRIVED -> ArrivalScreen(
+                        p = p,
                         place = selectedPlace,
-                        useDirectionalLayout = true,
                         onFinish = {
                             onStopNavigation()
                             screen = ProductionScreen.HOME
@@ -485,12 +592,14 @@ fun SolePrecisionApp(
                     )
 
                     ProductionScreen.SETTINGS -> SettingsScreen(
+                        p = p,
                         onBack = { screen = ProductionScreen.HOME },
                         onDeviceSettings = { screen = ProductionScreen.DEVICE_SETTINGS },
                         onAppSettings = { screen = ProductionScreen.APP_SETTINGS },
                     )
 
                     ProductionScreen.DEVICE_SETTINGS -> DeviceSettingsScreen(
+                        p = p,
                         wearableStatus = wearableStatus,
                         deviceCommandStatus = deviceCommandStatus,
                         preferences = userPreferences,
@@ -501,9 +610,11 @@ fun SolePrecisionApp(
                         onSetMockHardware = onSetMockHardware,
                         onSave = onSavePreferences,
                         onTestCommand = onSendDeviceCommand,
+                        guidancePhrases = guidancePhrases,
                     )
 
                     ProductionScreen.APP_SETTINGS -> AppSettingsScreen(
+                        p = p,
                         preferences = userPreferences,
                         recentCount = recentDestinations.size,
                         onBack = { screen = ProductionScreen.SETTINGS },
@@ -534,177 +645,199 @@ fun SolePrecisionApp(
             }
         }
     }
+    }
 }
 
 @Composable
-private fun HomeScreen(
-    wearableStatus: String,
-    currentLocation: UserLocation?,
-    locationStatus: String,
-    useDirectionalLayout: Boolean,
-    onNavigation: () -> Unit,
-    onSettings: () -> Unit,
-) {
-    val deviceState = when {
-        wearableStatus.contains("not connected", ignoreCase = true) ||
-            wearableStatus.contains("disconnected", ignoreCase = true) -> "Device not connected"
-        wearableStatus.contains("ready", ignoreCase = true) -> "Device ready"
-        wearableStatus.contains("connected", ignoreCase = true) -> "Device connected"
-        else -> "Device not connected"
-    }
-    if (useDirectionalLayout) {
-        SwipeOnlyScreen(
-            title = "Home",
-            actions = mapOf(
-                SwipeDirection.RIGHT to SwipeAction(
-                    label = "Navigation",
-                    symbol = "",
-                    color = MaterialTheme.colorScheme.primary,
-                ),
-                SwipeDirection.LEFT to SwipeAction(
-                    label = "Settings",
-                    symbol = "",
-                    color = Color.White,
-                ),
-            ),
-            onSwipe = { direction ->
-                when (direction) {
-                    SwipeDirection.RIGHT -> onNavigation()
-                    SwipeDirection.LEFT -> onSettings()
-                    else -> Unit
-                }
-            },
-            layout = SwipeScreenLayout.MENU,
-        ) {}
-        return
-    }
-
+private fun LocalizedMapPrivacyScreen(p: Phrases, onAccept: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
             .statusBarsPadding()
             .navigationBarsPadding()
-            .padding(12.dp)
-            .semantics { paneTitle = "Home" },
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+            .verticalScroll(rememberScrollState())
+            .padding(24.dp)
+            .semantics { paneTitle = p.consentTitle },
+        verticalArrangement = Arrangement.Center,
     ) {
-        HomeButton(
-            label = "Navigation",
-            supportingText = buildString {
-                append(deviceState)
-                if (currentLocation == null) {
-                    append(" · ")
-                    append(locationStatus)
-                }
-            },
-            onClick = onNavigation,
-            modifier = Modifier.weight(1f),
+        Text(
+            text = p.consentTitle,
+            fontSize = 32.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.semantics { heading() },
         )
-        HomeButton(
-            label = "Settings",
-            supportingText = "Device and application settings",
-            onClick = onSettings,
-            modifier = Modifier.weight(1f),
+        Spacer(Modifier.height(20.dp))
+        Text(
+            text = p.consentBody,
+            fontSize = 20.sp,
+            lineHeight = 29.sp,
         )
+        Spacer(Modifier.height(16.dp))
+        Text(
+            text = p.consentPrototypeNote,
+            color = SemanticColors.Optional,
+            fontSize = 18.sp,
+            lineHeight = 26.sp,
+        )
+        Spacer(Modifier.height(28.dp))
+        LargeAction(p.consentAgree, onClick = onAccept)
     }
 }
 
 @Composable
-private fun DestinationScreen(
-    showNavigationDemo: Boolean,
-    useDirectionalLayout: Boolean,
-    onBack: () -> Unit,
-    onSpeak: () -> Unit,
-    onType: () -> Unit,
-    onMap: () -> Unit,
-    onRecent: () -> Unit,
-    onMore: () -> Unit,
-    onCollections: () -> Unit,
-    onDemo: () -> Unit,
+private fun HomeScreen(
+    p: Phrases,
+    wearableStatus: String,
+    currentLocation: UserLocation?,
+    locationStatus: String,
+    speechUnavailable: Boolean,
+    onNavigation: () -> Unit,
+    onSettings: () -> Unit,
+    onWhereAmI: () -> Unit,
 ) {
-    if (useDirectionalLayout) {
-        DirectionalDestinationScreen(
-            onBack = onBack,
-            onMore = onMore,
-            onCollections = onCollections,
-        )
-        return
-    }
-
-    StandardScreen("Choose destination", onBack) {
-        if (showNavigationDemo) {
-            LargeAction(
-                label = "Start navigation demo",
-                supportingText = "No GPS, movement or destination search required",
-                onClick = onDemo,
-                modifier = Modifier.weight(2f),
-            )
-        }
-        LargeAction(
-            label = "Speak destination",
-            supportingText = "Use Android voice recognition",
-            onClick = onSpeak,
-            modifier = Modifier.weight(if (showNavigationDemo) 1f else 2f),
-        )
-        LargeAction(
-            label = "Recent destinations",
-            supportingText = "Choose a previously used destination",
-            onClick = onRecent,
-            modifier = Modifier.weight(1f),
-        )
-        Row(
+    SwipeOnlyScreen(
+        title = p.home,
+        actions = mapOf(
+            SwipeDirection.RIGHT to SwipeAction(
+                label = p.navigation,
+                symbol = "",
+                color = SemanticColors.Confirm,
+            ),
+            SwipeDirection.LEFT to SwipeAction(
+                label = p.settings,
+                symbol = "",
+                color = SemanticColors.Neutral,
+            ),
+            SwipeDirection.UP to SwipeAction(
+                label = p.whereAmI,
+                symbol = "",
+                color = SemanticColors.Optional,
+            ),
+        ),
+        onSwipe = { direction ->
+            when (direction) {
+                SwipeDirection.RIGHT -> onNavigation()
+                SwipeDirection.LEFT -> onSettings()
+                SwipeDirection.UP -> onWhereAmI()
+                else -> Unit
+            }
+        },
+        layout = SwipeScreenLayout.MENU,
+    ) {}
+    if (speechUnavailable) {
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                .statusBarsPadding()
+                .padding(12.dp),
         ) {
-            LargeOutlinedAction(
-                label = "Type destination",
-                onClick = onType,
-                modifier = Modifier.weight(1f),
-            )
-            LargeOutlinedAction(
-                label = "Point on map",
-                supportingText = "For a helper",
-                onClick = onMap,
-                modifier = Modifier.weight(1f),
+            Text(
+                p.speechUnavailableBanner,
+                color = Color.Black,
+                fontSize = 20.sp,
+                lineHeight = 27.sp,
+                fontWeight = FontWeight.Black,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.error)
+                    .padding(12.dp)
+                    .semantics { liveRegion = LiveRegionMode.Assertive },
             )
         }
+    }
+}
+
+@Composable
+private fun WhereAmIScreen(
+    p: Phrases,
+    text: String?,
+    onRefresh: () -> Unit,
+    onAnnounce: (String) -> Unit,
+    onBack: () -> Unit,
+) {
+    LaunchedEffect(Unit) {
+        onRefresh()
+    }
+    LaunchedEffect(text) {
+        if (!text.isNullOrBlank() && text != p.whereAmIWorking) {
+            onAnnounce(text)
+        }
+    }
+    SwipeOnlyScreen(
+        title = p.whereAmITitle,
+        actions = mapOf(
+            SwipeDirection.RIGHT to SwipeAction(
+                label = p.repeat,
+                symbol = "✓",
+                color = SemanticColors.Confirm,
+            ),
+            SwipeDirection.DOWN to SwipeAction(
+                label = p.back,
+                symbol = "↩",
+                color = SemanticColors.Neutral,
+            ),
+        ),
+        onSwipe = { direction ->
+            when (direction) {
+                SwipeDirection.DOWN -> onBack()
+                SwipeDirection.RIGHT -> onRefresh()
+                else -> Unit
+            }
+        },
+    ) {
+        Text(
+            text ?: p.whereAmIWorking,
+            fontSize = 28.sp,
+            lineHeight = 38.sp,
+            fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center,
+            modifier = Modifier
+                .fillMaxWidth()
+                .semantics { liveRegion = LiveRegionMode.Polite },
+        )
     }
 }
 
 @Composable
 private fun DirectionalDestinationScreen(
+    p: Phrases,
     onBack: () -> Unit,
     onMore: () -> Unit,
     onCollections: () -> Unit,
+    onNearby: () -> Unit,
 ) {
     SwipeOnlyScreen(
-        title = "Choose destination",
+        title = p.chooseDestination,
         actions = mapOf(
             SwipeDirection.RIGHT to SwipeAction(
-                label = "New destination",
+                label = p.newDestination,
                 symbol = "",
-                color = MaterialTheme.colorScheme.primary,
+                color = SemanticColors.Confirm,
             ),
             SwipeDirection.LEFT to SwipeAction(
-                label = "Recent and saved destinations",
+                label = p.recentAndSaved,
                 symbol = "",
-                color = Color.White,
+                color = SemanticColors.Neutral,
+            ),
+            SwipeDirection.UP to SwipeAction(
+                label = p.nearbyEssentials,
+                symbol = "",
+                color = SemanticColors.Optional,
             ),
             SwipeDirection.DOWN to SwipeAction(
-                label = "Back",
+                label = p.back,
                 symbol = "",
-                color = Color.White,
+                color = SemanticColors.Neutral,
             ),
         ),
         onSwipe = { direction ->
             when (direction) {
                 SwipeDirection.RIGHT -> onMore()
                 SwipeDirection.LEFT -> onCollections()
+                SwipeDirection.UP -> onNearby()
                 SwipeDirection.DOWN -> onBack()
-                else -> Unit
             }
         },
         layout = SwipeScreenLayout.MENU,
@@ -713,27 +846,28 @@ private fun DirectionalDestinationScreen(
 
 @Composable
 private fun DestinationMethodsScreen(
+    p: Phrases,
     onBack: () -> Unit,
     onSearchMap: () -> Unit,
     onVoice: () -> Unit,
 ) {
     SwipeOnlyScreen(
-        title = "New destination",
+        title = p.newDestination,
         actions = mapOf(
             SwipeDirection.RIGHT to SwipeAction(
-                label = "Voice destination",
+                label = p.voiceDestination,
                 symbol = "",
-                color = MaterialTheme.colorScheme.primary,
+                color = SemanticColors.Confirm,
             ),
             SwipeDirection.LEFT to SwipeAction(
-                label = "Search or point on map",
+                label = p.searchOrPointOnMap,
                 symbol = "",
-                color = Color.White,
+                color = SemanticColors.Neutral,
             ),
             SwipeDirection.DOWN to SwipeAction(
-                label = "Back",
+                label = p.back,
                 symbol = "",
-                color = Color.White,
+                color = SemanticColors.Neutral,
             ),
         ),
         onSwipe = { direction ->
@@ -749,102 +883,29 @@ private fun DestinationMethodsScreen(
 }
 
 @Composable
-private fun VoiceDestinationScreen(
-    state: DestinationSearchState,
-    onBack: () -> Unit,
-    onMicrophone: () -> Unit,
-) {
-    val isListening = state == DestinationSearchState.Listening
-    SwipeOnlyScreen(
-        title = if (isListening) "Listening" else "Voice destination",
-        actions = mapOf(
-            SwipeDirection.DOWN to SwipeAction(
-                label = "Back",
-                symbol = "",
-                color = Color.White,
-            ),
-        ),
-        onSwipe = { direction ->
-            if (direction == SwipeDirection.DOWN) onBack()
-        },
-    ) {
-        Button(
-            onClick = onMicrophone,
-            colors = ButtonDefaults.buttonColors(
-                containerColor = if (isListening) {
-                    Color(0xFFE53935)
-                } else {
-                    MaterialTheme.colorScheme.primary
-                },
-                contentColor = if (isListening) Color.White else Color.Black,
-            ),
-            elevation = ButtonDefaults.buttonElevation(defaultElevation = 12.dp),
-            modifier = Modifier
-                .fillMaxWidth(0.72f)
-                .height(240.dp)
-                .semantics {
-                    stateDescription = if (isListening) "Recording" else "Ready"
-                    contentDescription =
-                        if (isListening) "Microphone recording destination" else
-                            "Start destination voice recognition"
-                },
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(
-                    "🎙",
-                    fontSize = 96.sp,
-                    lineHeight = 104.sp,
-                    fontWeight = FontWeight.Black,
-                )
-                Text(
-                    if (isListening) "Listening…" else "Microphone",
-                    fontSize = 30.sp,
-                    lineHeight = 38.sp,
-                    fontWeight = FontWeight.Black,
-                    textAlign = TextAlign.Center,
-                )
-            }
-        }
-        Text(
-            when (state) {
-                DestinationSearchState.Listening -> "Speak the place name now"
-                is DestinationSearchState.Error -> state.message
-                else -> "Tap once, wait for the sound, then say your destination"
-            },
-            fontSize = 24.sp,
-            lineHeight = 32.sp,
-            fontWeight = FontWeight.Bold,
-            textAlign = TextAlign.Center,
-            modifier = Modifier
-                .fillMaxWidth()
-                .semantics { liveRegion = LiveRegionMode.Assertive },
-        )
-    }
-}
-
-@Composable
 private fun DestinationCollectionsScreen(
+    p: Phrases,
     onBack: () -> Unit,
     onSaved: () -> Unit,
     onRecent: () -> Unit,
 ) {
     SwipeOnlyScreen(
-        title = "Recent and saved destinations",
+        title = p.recentAndSaved,
         actions = mapOf(
             SwipeDirection.RIGHT to SwipeAction(
-                label = "Saved destinations",
+                label = p.savedDestinations,
                 symbol = "",
-                color = MaterialTheme.colorScheme.primary,
+                color = SemanticColors.Confirm,
             ),
             SwipeDirection.LEFT to SwipeAction(
-                label = "Recent destinations",
+                label = p.recentDestinations,
                 symbol = "",
-                color = Color.White,
+                color = SemanticColors.Neutral,
             ),
             SwipeDirection.DOWN to SwipeAction(
-                label = "Back",
+                label = p.back,
                 symbol = "",
-                color = Color.White,
+                color = SemanticColors.Neutral,
             ),
         ),
         onSwipe = { direction ->
@@ -860,11 +921,259 @@ private fun DestinationCollectionsScreen(
 }
 
 @Composable
+private fun NearbyCategoriesScreen(
+    p: Phrases,
+    onAnnounce: (String) -> Unit,
+    onBack: () -> Unit,
+    onSearch: (NearbyCategory) -> Unit,
+) {
+    val categories = NearbyCategory.entries
+    var index by rememberSaveable { mutableStateOf(0) }
+    val current = categories[index.coerceIn(0, categories.lastIndex)]
+
+    LaunchedEffect(index) {
+        onAnnounce(
+            p.nearbyCategoryAnnouncement.format(
+                index + 1,
+                categories.size,
+                p.nearbyCategoryLabel(current),
+            ),
+        )
+    }
+
+    SwipeOnlyScreen(
+        title = p.nearbyTitle,
+        actions = mapOf(
+            SwipeDirection.RIGHT to SwipeAction(
+                label = p.search,
+                symbol = "✓",
+                color = SemanticColors.Confirm,
+            ),
+            SwipeDirection.LEFT to SwipeAction(
+                label = p.next,
+                symbol = "✕",
+                color = SemanticColors.Neutral,
+            ),
+            SwipeDirection.DOWN to SwipeAction(
+                label = p.back,
+                symbol = "↩",
+                color = SemanticColors.Neutral,
+            ),
+        ),
+        onSwipe = { direction ->
+            when (direction) {
+                SwipeDirection.RIGHT -> onSearch(current)
+                SwipeDirection.LEFT -> index = (index + 1) % categories.size
+                SwipeDirection.DOWN -> onBack()
+                SwipeDirection.UP -> Unit
+            }
+        },
+    ) {
+        Text(
+            p.nearbyCategoryLabel(current),
+            fontSize = 40.sp,
+            lineHeight = 48.sp,
+            fontWeight = FontWeight.Black,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(10.dp))
+        Text(
+            p.nearbyIntro,
+            fontSize = 22.sp,
+            lineHeight = 30.sp,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+@Composable
+private fun NearbyResultsScreen(
+    p: Phrases,
+    results: List<PlaceCandidate>?,
+    status: String,
+    currentLocation: UserLocation?,
+    onAnnounce: (String) -> Unit,
+    onBack: () -> Unit,
+    onSelect: (PlaceCandidate) -> Unit,
+) {
+    val places = results.orEmpty()
+    var index by rememberSaveable(results?.size) { mutableStateOf(0) }
+    val current = places.getOrNull(index.coerceIn(0, (places.size - 1).coerceAtLeast(0)))
+    val distanceText = current?.let { place ->
+        currentLocation?.let { location ->
+            p.distanceAwayPhrase(
+                distanceMeters(
+                    location.latitude,
+                    location.longitude,
+                    place.latitude,
+                    place.longitude,
+                ),
+            )
+        }
+    } ?: p.distanceUnavailable
+
+    LaunchedEffect(index, current?.id, results != null) {
+        when {
+            results == null -> Unit
+            current == null -> onAnnounce(status.ifBlank { p.noMatchingPlaces })
+            else -> onAnnounce(
+                p.nearbyItemAnnouncement.format(
+                    index + 1,
+                    places.size,
+                    listOf(current.name, current.address)
+                        .filter(String::isNotBlank)
+                        .joinToString(", "),
+                    distanceText,
+                ),
+            )
+        }
+    }
+
+    val actions = buildMap {
+        if (current != null) {
+            put(
+                SwipeDirection.RIGHT,
+                SwipeAction(p.startNavigation, "✓", SemanticColors.Confirm),
+            )
+            if (index < places.lastIndex) {
+                put(SwipeDirection.LEFT, SwipeAction(p.next, "✕", SemanticColors.Decline))
+            }
+        }
+        put(SwipeDirection.DOWN, SwipeAction(p.back, "↩", SemanticColors.Neutral))
+    }
+
+    SwipeOnlyScreen(
+        title = p.nearbyTitle,
+        actions = actions,
+        onSwipe = { direction ->
+            when (direction) {
+                SwipeDirection.RIGHT -> current?.let(onSelect)
+                SwipeDirection.LEFT -> if (index < places.lastIndex) index += 1
+                SwipeDirection.DOWN -> onBack()
+                SwipeDirection.UP -> Unit
+            }
+        },
+    ) {
+        when {
+            results == null -> Text(
+                status.ifBlank { p.findingAddress },
+                fontSize = 26.sp,
+                lineHeight = 34.sp,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            )
+
+            current == null -> Text(
+                status.ifBlank { p.noMatchingPlaces },
+                fontSize = 26.sp,
+                lineHeight = 34.sp,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            )
+
+            else -> {
+                Text(
+                    current.name,
+                    fontSize = 36.sp,
+                    lineHeight = 44.sp,
+                    fontWeight = FontWeight.Black,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    distanceText,
+                    fontSize = 24.sp,
+                    lineHeight = 32.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun VoiceDestinationScreen(
+    p: Phrases,
+    state: DestinationSearchState,
+    onBack: () -> Unit,
+    onMicrophone: () -> Unit,
+) {
+    val isListening = state == DestinationSearchState.Listening
+    SwipeOnlyScreen(
+        title = if (isListening) p.listening else p.voiceDestination,
+        actions = mapOf(
+            SwipeDirection.DOWN to SwipeAction(
+                label = p.back,
+                symbol = "",
+                color = SemanticColors.Neutral,
+            ),
+        ),
+        onSwipe = { direction ->
+            if (direction == SwipeDirection.DOWN) onBack()
+        },
+    ) {
+        Button(
+            onClick = onMicrophone,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (isListening) {
+                    SemanticColors.Decline
+                } else {
+                    SemanticColors.Confirm
+                },
+                contentColor = SemanticColors.OnLight,
+            ),
+            elevation = ButtonDefaults.buttonElevation(defaultElevation = 12.dp),
+            modifier = Modifier
+                .fillMaxWidth(0.72f)
+                .height(240.dp)
+                .semantics {
+                    stateDescription = if (isListening) p.micRecording else p.micReady
+                    contentDescription =
+                        if (isListening) p.micRecordingDescription else p.micStartDescription
+                },
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    "🎙",
+                    fontSize = 96.sp,
+                    lineHeight = 104.sp,
+                    fontWeight = FontWeight.Black,
+                )
+                Text(
+                    if (isListening) p.listeningEllipsis else p.microphone,
+                    fontSize = 30.sp,
+                    lineHeight = 38.sp,
+                    fontWeight = FontWeight.Black,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        }
+        Text(
+            when (state) {
+                DestinationSearchState.Listening -> p.speakPlaceNow
+                is DestinationSearchState.Error -> p.statusText(state.message)
+                else -> p.tapMicrophoneHint
+            },
+            fontSize = 24.sp,
+            lineHeight = 32.sp,
+            fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center,
+            modifier = Modifier
+                .fillMaxWidth()
+                .semantics { liveRegion = LiveRegionMode.Assertive },
+        )
+    }
+}
+
+@Composable
 private fun TypeDestinationScreen(
+    p: Phrases,
     value: String,
     onValueChange: (String) -> Unit,
     suggestions: List<DestinationSuggestion>,
-    useDirectionalLayout: Boolean,
     onBack: () -> Unit,
     onSearch: () -> Unit,
     onRequestSuggestions: (String) -> Unit,
@@ -875,92 +1184,60 @@ private fun TypeDestinationScreen(
         onRequestSuggestions(value)
     }
 
-    if (useDirectionalLayout) {
-        val firstSuggestion = suggestions.firstOrNull()
-        val actions = buildMap {
+    val firstSuggestion = suggestions.firstOrNull()
+    val actions = buildMap {
+        put(
+            SwipeDirection.LEFT,
+            SwipeAction(p.clear, "✕", SemanticColors.Decline),
+        )
+        if (value.isNotBlank()) {
             put(
-                SwipeDirection.LEFT,
-                SwipeAction("Clear", "✕", Color(0xFFFF8A80)),
-            )
-            if (value.isNotBlank()) {
-                put(
-                    SwipeDirection.RIGHT,
-                    SwipeAction("Search", "✓", MaterialTheme.colorScheme.primary),
-                )
-            }
-            if (firstSuggestion != null) {
-                put(
-                    SwipeDirection.UP,
-                    SwipeAction(
-                        "Use ${firstSuggestion.name}",
-                        "↑",
-                        MaterialTheme.colorScheme.primary,
-                    ),
-                )
-            }
-            put(
-                SwipeDirection.DOWN,
-                SwipeAction("Back", "↩", Color.White),
+                SwipeDirection.RIGHT,
+                SwipeAction(p.search, "✓", SemanticColors.Confirm),
             )
         }
-        SwipeOnlyScreen(
-            title = "Type destination",
-            actions = actions,
-            onSwipe = { direction ->
-                when (direction) {
-                    SwipeDirection.LEFT -> onValueChange("")
-                    SwipeDirection.RIGHT -> if (value.isNotBlank()) onSearch()
-                    SwipeDirection.UP -> firstSuggestion?.let(onSelectSuggestion)
-                    SwipeDirection.DOWN -> onBack()
-                    else -> Unit
-                }
-            },
-        ) {
-            OutlinedTextField(
-                value = value,
-                onValueChange = onValueChange,
-                label = { Text("Place name or address") },
-                minLines = 3,
-                textStyle = MaterialTheme.typography.headlineSmall,
-                modifier = Modifier.fillMaxWidth(),
+        if (firstSuggestion != null) {
+            put(
+                SwipeDirection.UP,
+                SwipeAction(
+                    p.useSuggestionPrefix.format(firstSuggestion.name),
+                    "↑",
+                    SemanticColors.Confirm,
+                ),
             )
-            firstSuggestion?.let {
-                Text(
-                    text = "AMap suggestion: ${it.name}\n${it.supportingText}",
-                    fontSize = 24.sp,
-                    lineHeight = 30.sp,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
         }
-        return
+        put(
+            SwipeDirection.DOWN,
+            SwipeAction(p.back, "↩", SemanticColors.Neutral),
+        )
     }
-
-    StandardScreen(
-        title = "Type destination",
-        onBack = onBack,
-        scrollable = true,
+    SwipeOnlyScreen(
+        title = p.typeDestination,
+        actions = actions,
+        onSwipe = { direction ->
+            when (direction) {
+                SwipeDirection.LEFT -> onValueChange("")
+                SwipeDirection.RIGHT -> if (value.isNotBlank()) onSearch()
+                SwipeDirection.UP -> firstSuggestion?.let(onSelectSuggestion)
+                SwipeDirection.DOWN -> onBack()
+            }
+        },
     ) {
         OutlinedTextField(
             value = value,
             onValueChange = onValueChange,
-            label = { Text("Place name or address") },
-            singleLine = false,
+            label = { Text(p.placeNameOrAddress) },
             minLines = 3,
             textStyle = MaterialTheme.typography.headlineSmall,
             modifier = Modifier.fillMaxWidth(),
         )
-        LargeAction(
-            label = "Search for this place",
-            onClick = onSearch,
-            enabled = value.isNotBlank(),
-        )
-        suggestions.forEach { suggestion ->
-            LargeAction(
-                label = suggestion.name,
-                supportingText = suggestion.supportingText,
-                onClick = { onSelectSuggestion(suggestion) },
+        firstSuggestion?.let {
+            Text(
+                text = p.amapSuggestionPrefix.format(it.name) + "\n" + it.supportingText,
+                fontSize = 24.sp,
+                lineHeight = 30.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
             )
         }
     }
@@ -968,6 +1245,7 @@ private fun TypeDestinationScreen(
 
 @Composable
 private fun MapDestinationScreen(
+    p: Phrases,
     currentLocation: UserLocation?,
     query: String,
     onQueryChange: (String) -> Unit,
@@ -1004,7 +1282,7 @@ private fun MapDestinationScreen(
     var pointedLocation by remember { mutableStateOf<LatLng?>(null) }
     var pointedSuggestion by remember { mutableStateOf<DestinationSuggestion?>(null) }
     var resolvedAddress by remember { mutableStateOf<ResolvedMapAddress?>(null) }
-    var pointStatus by remember { mutableStateOf("Tap the map to select a destination") }
+    var pointStatus by remember { mutableStateOf(p.tapMapToSelect) }
     var hasCenteredMap by remember(mapView) { mutableStateOf(false) }
     val reverseGeocoder = remember { AmapReverseGeocodeController(context) }
 
@@ -1041,8 +1319,8 @@ private fun MapDestinationScreen(
                 onSelect(
                     PlaceCandidate(
                         id = "map-${point.latitude}-${point.longitude}",
-                        name = resolved?.name ?: "Pinned map location",
-                        address = resolved?.address ?: "Selected on AMap",
+                        name = resolved?.name ?: p.pinnedMapLocation,
+                        address = resolved?.address ?: p.selectedOnAmap,
                         area = resolved?.area.orEmpty(),
                         latitude = point.latitude,
                         longitude = point.longitude,
@@ -1056,13 +1334,13 @@ private fun MapDestinationScreen(
         pointedLocation = point
         pointedSuggestion = null
         resolvedAddress = null
-        pointStatus = "Finding address…"
+        pointStatus = p.findingAddress
         mapView.map.apply {
             clear()
             addMarker(
                 MarkerOptions()
                     .position(point)
-                    .title("Selected destination"),
+                    .title(p.selectedDestination),
             )
         }
         reverseGeocoder.resolve(point.latitude, point.longitude) { result ->
@@ -1089,7 +1367,7 @@ private fun MapDestinationScreen(
             pointedSuggestion = suggestion
             resolvedAddress = ResolvedMapAddress(
                 name = suggestion.name,
-                address = suggestion.address.ifBlank { "Selected from AMap search" },
+                address = suggestion.address.ifBlank { p.selectedOnAmap },
                 area = suggestion.area,
             )
             pointStatus = suggestion.name
@@ -1123,7 +1401,7 @@ private fun MapDestinationScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .semantics { paneTitle = "Point on AMap" },
+            .semantics { paneTitle = p.pointOnAmap },
     ) {
         AndroidView(
             factory = { mapView },
@@ -1151,7 +1429,7 @@ private fun MapDestinationScreen(
                     OutlinedTextField(
                         value = query,
                         onValueChange = onQueryChange,
-                        label = { Text("Search AMap") },
+                        label = { Text(p.searchAmap) },
                         singleLine = true,
                         textStyle = MaterialTheme.typography.titleLarge,
                         modifier = Modifier.weight(1f),
@@ -1161,7 +1439,7 @@ private fun MapDestinationScreen(
                         enabled = query.isNotBlank(),
                         modifier = Modifier.height(64.dp),
                     ) {
-                        Text("Search", fontSize = 18.sp, fontWeight = FontWeight.Black)
+                        Text(p.search, fontSize = 18.sp, fontWeight = FontWeight.Black)
                     }
                 }
                 suggestions.take(3).forEach { suggestion ->
@@ -1218,14 +1496,14 @@ private fun MapDestinationScreen(
                     .weight(1f)
                     .height(72.dp),
             ) {
-                Text("← Back", fontSize = 20.sp, fontWeight = FontWeight.Black)
+                Text(p.back, fontSize = 20.sp, fontWeight = FontWeight.Black)
             }
             OutlinedButton(
                 onClick = {
                     pointedLocation = null
                     pointedSuggestion = null
                     resolvedAddress = null
-                    pointStatus = "Tap the map to select a destination"
+                    pointStatus = p.tapMapToSelect
                     mapView.map.clear()
                 },
                 enabled = pointedLocation != null,
@@ -1237,7 +1515,7 @@ private fun MapDestinationScreen(
                     .weight(1f)
                     .height(72.dp),
             ) {
-                Text("Clear", fontSize = 20.sp, fontWeight = FontWeight.Black)
+                Text(p.clear, fontSize = 20.sp, fontWeight = FontWeight.Black)
             }
             Button(
                 onClick = selectPoint,
@@ -1247,200 +1525,160 @@ private fun MapDestinationScreen(
                     .weight(1.25f)
                     .height(72.dp),
             ) {
-                Text("Use point", fontSize = 20.sp, fontWeight = FontWeight.Black)
+                Text(p.usePoint, fontSize = 20.sp, fontWeight = FontWeight.Black)
             }
         }
     }
 }
 
+/** Shared browser for recent and saved destination lists, one place at a time. */
 @Composable
-private fun RecentPlacesScreen(
+private fun PlaceListScreen(
+    p: Phrases,
+    title: String,
     places: List<PlaceCandidate>,
-    useDirectionalLayout: Boolean,
+    emptyText: String,
+    announcementTemplate: String,
+    allowRemove: Boolean,
     onAnnounce: (String) -> Unit,
     onBack: () -> Unit,
+    onRemove: (PlaceCandidate) -> Unit,
     onSelect: (PlaceCandidate) -> Unit,
 ) {
-    if (useDirectionalLayout) {
-        var index by rememberSaveable(places.size) { mutableStateOf(0) }
-        val current = places.getOrNull(index.coerceAtMost((places.size - 1).coerceAtLeast(0)))
-        LaunchedEffect(index, current?.id) {
-            current?.let {
-                onAnnounce(
-                    "Recent destination ${index + 1} of ${places.size}. ${it.name}. " +
-                        "Swipe right to confirm, left for the next place, or down to go back.",
-                )
-            }
+    var index by rememberSaveable(places.size) { mutableStateOf(0) }
+    val current = places.getOrNull(index.coerceAtMost((places.size - 1).coerceAtLeast(0)))
+    LaunchedEffect(index, current?.id) {
+        current?.let {
+            onAnnounce(announcementTemplate.format(index + 1, places.size, it.name))
         }
-        val actions = buildMap {
-            if (current != null && index < places.lastIndex) {
-                put(
-                    SwipeDirection.LEFT,
-                    SwipeAction("Next place", "✕", Color(0xFFFF8A80)),
-                )
-            }
-            if (current != null) {
-                put(
-                    SwipeDirection.RIGHT,
-                    SwipeAction("Use this place", "✓", MaterialTheme.colorScheme.primary),
-                )
-            }
+    }
+    val actions = buildMap {
+        if (current != null && index < places.lastIndex) {
             put(
-                SwipeDirection.DOWN,
-                SwipeAction("Back", "↩", Color.White),
+                SwipeDirection.LEFT,
+                SwipeAction(p.nextPlace, "✕", SemanticColors.Decline),
             )
         }
-        SwipeOnlyScreen(
-            title = "Recent destinations",
-            actions = actions,
-            onSwipe = { direction ->
-                when (direction) {
-                    SwipeDirection.LEFT -> {
-                        if (index < places.lastIndex) index += 1
-                    }
-                    SwipeDirection.RIGHT -> current?.let(onSelect)
-                    SwipeDirection.UP -> Unit
-                    SwipeDirection.DOWN -> onBack()
-                }
-            },
-        ) {
-            if (current == null) {
-                Text(
-                    "No recent destinations yet.",
-                    fontSize = 25.sp,
-                    textAlign = TextAlign.Center,
-                )
-            } else {
-                Text(
-                    current.name,
-                    fontSize = 40.sp,
-                    lineHeight = 48.sp,
-                    fontWeight = FontWeight.Black,
-                    textAlign = TextAlign.Center,
+        if (current != null) {
+            put(
+                SwipeDirection.RIGHT,
+                SwipeAction(p.usePlace, "✓", SemanticColors.Confirm),
+            )
+            if (allowRemove) {
+                put(
+                    SwipeDirection.UP,
+                    SwipeAction(p.removeFromSaved, "↑", SemanticColors.Optional),
                 )
             }
         }
-        return
+        put(
+            SwipeDirection.DOWN,
+            SwipeAction(p.back, "↩", SemanticColors.Neutral),
+        )
     }
-
-    StandardScreen(
-        title = "Recent destinations",
-        onBack = onBack,
-        scrollable = true,
+    SwipeOnlyScreen(
+        title = title,
+        actions = actions,
+        onSwipe = { direction ->
+            when (direction) {
+                SwipeDirection.LEFT -> {
+                    if (index < places.lastIndex) index += 1
+                }
+                SwipeDirection.RIGHT -> current?.let(onSelect)
+                SwipeDirection.UP -> if (allowRemove) {
+                    current?.let {
+                        onRemove(it)
+                        index = index.coerceAtMost((places.size - 2).coerceAtLeast(0))
+                    }
+                }
+                SwipeDirection.DOWN -> onBack()
+            }
+        },
     ) {
-        if (places.isEmpty()) {
+        if (current == null) {
             Text(
-                "No recent destinations yet. Use Speak destination or Type destination first.",
-                fontSize = 23.sp,
-                lineHeight = 32.sp,
+                emptyText,
+                fontSize = 25.sp,
+                lineHeight = 33.sp,
+                textAlign = TextAlign.Center,
             )
         } else {
-            places.forEach { place ->
-                LargeAction(
-                    label = place.name,
-                    supportingText = place.area.ifBlank { place.address },
-                    onClick = { onSelect(place) },
-                )
-            }
+            Text(
+                current.name,
+                fontSize = 40.sp,
+                lineHeight = 48.sp,
+                fontWeight = FontWeight.Black,
+                textAlign = TextAlign.Center,
+            )
         }
     }
 }
 
 @Composable
 private fun SearchStatusScreen(
+    p: Phrases,
     state: DestinationSearchState,
-    useDirectionalLayout: Boolean,
     onBack: () -> Unit,
     onRetryVoice: () -> Unit,
     onType: () -> Unit,
 ) {
     val message = when (state) {
-        is DestinationSearchState.Searching -> "Searching AMap for ${state.query}"
-        DestinationSearchState.Listening -> "Listening for your destination…"
-        is DestinationSearchState.Error -> state.message
-        else -> "Waiting for a destination"
+        is DestinationSearchState.Searching -> p.searchingAmapFor.format(state.query)
+        DestinationSearchState.Listening -> p.listeningForDestination
+        is DestinationSearchState.Error -> p.statusText(state.message)
+        else -> p.waitingForDestination
     }
-    if (useDirectionalLayout) {
-        val actions = buildMap {
-            if (state is DestinationSearchState.Error) {
-                put(
-                    SwipeDirection.LEFT,
-                    SwipeAction("Try voice again", "✕", Color(0xFFFF8A80)),
-                )
-                put(
-                    SwipeDirection.RIGHT,
-                    SwipeAction("Type destination", "✓", MaterialTheme.colorScheme.primary),
-                )
-            }
+    val actions = buildMap {
+        if (state is DestinationSearchState.Error) {
             put(
-                SwipeDirection.DOWN,
-                SwipeAction("Back", "↩", Color.White),
+                SwipeDirection.LEFT,
+                SwipeAction(p.tryVoiceAgain, "✕", SemanticColors.Decline),
+            )
+            put(
+                SwipeDirection.RIGHT,
+                SwipeAction(p.typeDestination, "✓", SemanticColors.Confirm),
             )
         }
-        SwipeOnlyScreen(
-            title = "Destination search",
-            actions = actions,
-            onSwipe = { direction ->
-                when (direction) {
-                    SwipeDirection.LEFT -> if (state is DestinationSearchState.Error) {
-                        onRetryVoice()
-                    }
-                    SwipeDirection.RIGHT -> if (state is DestinationSearchState.Error) onType()
-                    SwipeDirection.DOWN -> onBack()
-                    else -> Unit
-                }
-            },
-        ) {
-            Text(
-                message,
-                fontSize = 28.sp,
-                lineHeight = 38.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center,
-            )
-        }
-        return
+        put(
+            SwipeDirection.DOWN,
+            SwipeAction(p.back, "↩", SemanticColors.Neutral),
+        )
     }
-
-    StandardScreen(
-        title = "Destination search",
-        onBack = onBack,
+    SwipeOnlyScreen(
+        title = p.destinationSearch,
+        actions = actions,
+        onSwipe = { direction ->
+            when (direction) {
+                SwipeDirection.LEFT -> if (state is DestinationSearchState.Error) {
+                    onRetryVoice()
+                }
+                SwipeDirection.RIGHT -> if (state is DestinationSearchState.Error) onType()
+                SwipeDirection.DOWN -> onBack()
+                else -> Unit
+            }
+        },
     ) {
         Text(
-            text = message,
+            message,
             fontSize = 28.sp,
             lineHeight = 38.sp,
             fontWeight = FontWeight.Bold,
-            modifier = Modifier
-                .weight(1f)
-                .semantics { liveRegion = LiveRegionMode.Polite },
+            textAlign = TextAlign.Center,
+            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
         )
-        if (state is DestinationSearchState.Error) {
-            LargeAction("Try speaking again", onClick = onRetryVoice)
-            LargeOutlinedAction("Type destination", onClick = onType)
-        }
     }
 }
 
 @Composable
 private fun SearchResultsScreen(
+    p: Phrases,
     state: DestinationSearchState,
     currentLocation: UserLocation?,
+    speechDetail: SpeechDetail,
     onAnnounce: (String) -> Unit,
-    useDirectionalLayout: Boolean,
     onBack: () -> Unit,
     onSelect: (PlaceCandidate) -> Unit,
 ) {
-    if (!useDirectionalLayout) {
-        SearchResultsButtonScreen(
-            state = state,
-            currentLocation = currentLocation,
-            onBack = onBack,
-            onSelect = onSelect,
-        )
-        return
-    }
-
     val resultState = state as? DestinationSearchState.Results
     val results = resultState?.places.orEmpty()
     var index by rememberSaveable(resultState?.query) { mutableStateOf(0) }
@@ -1451,7 +1689,7 @@ private fun SearchResultsScreen(
     }
     val distance = current?.let { place ->
         currentLocation?.let { location ->
-            formatDistance(
+            p.distanceAwayPhrase(
                 distanceMeters(
                     location.latitude,
                     location.longitude,
@@ -1460,13 +1698,13 @@ private fun SearchResultsScreen(
                 ),
             )
         }
-    } ?: "Distance unavailable"
+    } ?: p.distanceUnavailable
 
     val next = {
         if (index < results.lastIndex) {
             index += 1
         } else {
-            onAnnounce("This is the last option.")
+            onAnnounce(p.lastOption)
         }
     }
     val select = {
@@ -1476,10 +1714,15 @@ private fun SearchResultsScreen(
 
     LaunchedEffect(index, current?.id, distance) {
         current?.let { place ->
+            val description = when (speechDetail) {
+                SpeechDetail.CONCISE -> place.name
+                SpeechDetail.STANDARD -> listOf(place.name, place.address)
+                    .filter(String::isNotBlank)
+                    .joinToString(", ")
+                SpeechDetail.DETAILED -> p.placeDescription(place)
+            }
             onAnnounce(
-                "Option ${index + 1} of ${results.size}. ${place.spokenDescription}. " +
-                    "$distance. Swipe right to confirm, left to decline and hear the next option, " +
-                    "or down to go back.",
+                p.optionXofY.format(index + 1, results.size) + ". $description. $distance.",
             )
         }
     }
@@ -1488,22 +1731,22 @@ private fun SearchResultsScreen(
         if (current != null && index < results.lastIndex) {
             put(
                 SwipeDirection.LEFT,
-                SwipeAction("Decline · next", "✕", Color(0xFFFF8A80)),
+                SwipeAction(p.declineNext, "✕", SemanticColors.Decline),
             )
         }
         if (current != null) {
             put(
                 SwipeDirection.RIGHT,
-                SwipeAction("Confirm", "✓", MaterialTheme.colorScheme.primary),
+                SwipeAction(p.confirm, "✓", SemanticColors.Confirm),
             )
         }
         put(
             SwipeDirection.DOWN,
-            SwipeAction("Back", "↩", Color.White),
+            SwipeAction(p.back, "↩", SemanticColors.Neutral),
         )
     }
     SwipeOnlyScreen(
-        title = "Choose the correct place",
+        title = p.chooseCorrectPlace,
         actions = actions,
         onSwipe = { direction ->
             when (direction) {
@@ -1516,7 +1759,7 @@ private fun SearchResultsScreen(
     ) {
         if (current == null) {
             Text(
-                "No matching places were found. Swipe down to go back and try again.",
+                p.noMatchingPlaces,
                 fontSize = 24.sp,
                 lineHeight = 34.sp,
                 textAlign = TextAlign.Center,
@@ -1538,141 +1781,82 @@ private fun SearchResultsScreen(
 }
 
 @Composable
-private fun SearchResultsButtonScreen(
-    state: DestinationSearchState,
-    currentLocation: UserLocation?,
-    onBack: () -> Unit,
-    onSelect: (PlaceCandidate) -> Unit,
-) {
-    val results = (state as? DestinationSearchState.Results)?.places.orEmpty()
-    StandardScreen("Choose the correct place", onBack, scrollable = true) {
-        if (results.isEmpty()) {
-            Text(
-                "No matching places were found. Go back and try a more specific name.",
-                fontSize = 23.sp,
-                lineHeight = 32.sp,
-                textAlign = TextAlign.Center,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .semantics { liveRegion = LiveRegionMode.Polite },
-            )
-        } else {
-            results.forEachIndexed { index, place ->
-                val distance = currentLocation?.let { location ->
-                    formatDistance(
-                        distanceMeters(
-                            location.latitude,
-                            location.longitude,
-                            place.latitude,
-                            place.longitude,
-                        ),
-                    )
-                } ?: "Distance unavailable"
-                LargeAction(
-                    label = place.name,
-                    supportingText = listOf(
-                        place.address,
-                        place.area,
-                        distance,
-                    ).filter(String::isNotBlank).joinToString(" · "),
-                    onClick = { onSelect(place) },
-                    stateDescription = "Result ${index + 1} of ${results.size}",
-                )
-            }
-        }
-    }
-}
-
-@Composable
 private fun ConfirmPlaceScreen(
+    p: Phrases,
     place: PlaceCandidate,
-    useDirectionalLayout: Boolean,
+    isSaved: Boolean,
     onBack: () -> Unit,
     onConfirm: () -> Unit,
     onChooseAnother: () -> Unit,
+    onSave: () -> Unit,
 ) {
-    if (useDirectionalLayout) {
-        SwipeOnlyScreen(
-            title = "Confirm destination",
-            actions = mapOf(
-                SwipeDirection.LEFT to SwipeAction(
-                    label = "Decline",
-                    symbol = "✕",
-                    color = Color(0xFFFF8A80),
-                ),
-                SwipeDirection.RIGHT to SwipeAction(
-                    label = "Confirm",
-                    symbol = "✓",
-                    color = MaterialTheme.colorScheme.primary,
-                ),
-                SwipeDirection.DOWN to SwipeAction(
-                    label = "Back",
-                    symbol = "↩",
-                    color = Color.White,
-                ),
-            ),
-            onSwipe = { direction ->
-                when (direction) {
-                    SwipeDirection.LEFT -> onChooseAnother()
-                    SwipeDirection.RIGHT -> onConfirm()
-                    SwipeDirection.DOWN -> onBack()
-                    else -> Unit
-                }
-            },
-        ) {
+    val actions = buildMap {
+        put(
+            SwipeDirection.LEFT,
+            SwipeAction(p.decline, "✕", SemanticColors.Decline),
+        )
+        put(
+            SwipeDirection.RIGHT,
+            SwipeAction(p.confirm, "✓", SemanticColors.Confirm),
+        )
+        if (!isSaved) {
+            put(
+                SwipeDirection.UP,
+                SwipeAction(p.savePlace, "↑", SemanticColors.Optional),
+            )
+        }
+        put(
+            SwipeDirection.DOWN,
+            SwipeAction(p.back, "↩", SemanticColors.Neutral),
+        )
+    }
+    SwipeOnlyScreen(
+        title = p.confirmDestination,
+        actions = actions,
+        onSwipe = { direction ->
+            when (direction) {
+                SwipeDirection.LEFT -> onChooseAnother()
+                SwipeDirection.RIGHT -> onConfirm()
+                SwipeDirection.UP -> if (!isSaved) onSave()
+                SwipeDirection.DOWN -> onBack()
+            }
+        },
+    ) {
+        Text(
+            place.name,
+            fontSize = 36.sp,
+            lineHeight = 44.sp,
+            fontWeight = FontWeight.Black,
+            textAlign = TextAlign.Center,
+        )
+        val details = p.placeAccessibilityDetails(place)
+        if (details.isNotBlank()) {
+            Spacer(Modifier.height(12.dp))
             Text(
-                place.name,
-                fontSize = 36.sp,
-                lineHeight = 44.sp,
-                fontWeight = FontWeight.Black,
+                details,
+                fontSize = 22.sp,
+                lineHeight = 30.sp,
+                fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center,
             )
-            if (place.accessibilityDetails.isNotBlank()) {
-                Spacer(Modifier.height(12.dp))
-                Text(
-                    place.accessibilityDetails,
-                    fontSize = 22.sp,
-                    lineHeight = 30.sp,
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center,
-                )
-            }
         }
-        return
-    }
-
-    StandardScreen(
-        title = "Confirm destination",
-        onBack = onBack,
-    ) {
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .semantics { liveRegion = LiveRegionMode.Polite },
-            verticalArrangement = Arrangement.Center,
-        ) {
-            Text(place.name, fontSize = 34.sp, lineHeight = 42.sp, fontWeight = FontWeight.Black)
-            Spacer(Modifier.height(16.dp))
+        if (isSaved) {
+            Spacer(Modifier.height(10.dp))
             Text(
-                listOf(place.address, place.area).filter(String::isNotBlank).joinToString(", "),
-                fontSize = 23.sp,
-                lineHeight = 32.sp,
+                p.placeSaved,
+                color = SemanticColors.Optional,
+                fontSize = 20.sp,
+                lineHeight = 27.sp,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
             )
         }
-        LargeAction(
-            "Yes, use this place",
-            onClick = onConfirm,
-        )
-        LargeOutlinedAction(
-            "Choose another place",
-            onClick = onChooseAnother,
-        )
     }
 }
 
 @Composable
 private fun RouteOptionsScreen(
+    p: Phrases,
     routes: List<RouteSummary>,
     status: String,
     locationStatus: String,
@@ -1690,12 +1874,7 @@ private fun RouteOptionsScreen(
     LaunchedEffect(index, route, status) {
         if (route != null) {
             onAnnounce(
-                "Walking route ${index + 1} of ${routes.size}. ${route.mentalMapSummary}. " +
-                    if (routes.size > 1) {
-                        "Swipe right to choose this route, left for the next route, or down to go back."
-                    } else {
-                        "Swipe right to choose this route or down to go back."
-                    },
+                p.routeXofY.format(index + 1, routes.size) + ". " + p.routeSummary(route),
             )
         }
     }
@@ -1704,24 +1883,27 @@ private fun RouteOptionsScreen(
         if (route != null && routes.size > 1) {
             put(
                 SwipeDirection.LEFT,
-                SwipeAction("Next route", "←", Color.White),
+                SwipeAction(p.nextRoute, "←", SemanticColors.Neutral),
             )
         }
         if (route != null) {
             put(
                 SwipeDirection.RIGHT,
-                SwipeAction("Choose route", "✓", MaterialTheme.colorScheme.primary),
+                SwipeAction(p.chooseRoute, "✓", SemanticColors.Confirm),
             )
         }
         put(
             SwipeDirection.DOWN,
-            SwipeAction("Back", "↩", Color.White),
+            SwipeAction(p.back, "↩", SemanticColors.Neutral),
         )
     }
 
     SwipeOnlyScreen(
-        title = if (route == null) "Preparing walking routes" else
-            "Route ${index + 1} of ${routes.size}",
+        title = if (route == null) {
+            p.routeOptionsPreparing
+        } else {
+            p.routeXofY.format(index + 1, routes.size)
+        },
         actions = actions,
         onSwipe = { direction ->
             when (direction) {
@@ -1735,8 +1917,12 @@ private fun RouteOptionsScreen(
         },
     ) {
         Text(
-            route?.mentalMapSummary
-                ?: if (currentLocation == null) locationStatus else status,
+            route?.let(p::routeSummary)
+                ?: if (currentLocation == null) {
+                    p.statusText(locationStatus)
+                } else {
+                    p.statusText(status)
+                },
             fontSize = 28.sp,
             lineHeight = 38.sp,
             fontWeight = FontWeight.Black,
@@ -1748,159 +1934,115 @@ private fun RouteOptionsScreen(
 
 @Composable
 private fun RoutePreviewScreen(
+    p: Phrases,
     place: PlaceCandidate?,
     summary: RouteSummary?,
     status: String,
     locationStatus: String,
     currentLocation: UserLocation?,
     isSimulation: Boolean,
-    useDirectionalLayout: Boolean,
+    isMovementSimulated: Boolean,
+    weather: LocalWeather?,
     onBack: () -> Unit,
     onStart: () -> Unit,
     onReview: () -> Unit,
 ) {
-    if (useDirectionalLayout) {
-        val actions = buildMap {
+    val actions = buildMap {
+        put(
+            SwipeDirection.LEFT,
+            SwipeAction(p.declineRoute, "✕", SemanticColors.Decline),
+        )
+        if (summary != null) {
             put(
-                SwipeDirection.LEFT,
-                SwipeAction("Decline route", "✕", Color(0xFFFF8A80)),
+                SwipeDirection.RIGHT,
+                SwipeAction(p.startNavigation, "✓", SemanticColors.Confirm),
             )
-            if (summary != null) {
+            if (summary.steps.isNotEmpty()) {
                 put(
-                    SwipeDirection.RIGHT,
-                    SwipeAction("Start navigation", "✓", MaterialTheme.colorScheme.primary),
+                    SwipeDirection.UP,
+                    SwipeAction(p.reviewFullRoute, "↑", SemanticColors.Optional),
                 )
-                if (summary.steps.isNotEmpty()) {
-                    put(
-                        SwipeDirection.UP,
-                        SwipeAction("Review full route", "↑", Color.White),
-                    )
-                }
-            }
-            put(
-                SwipeDirection.DOWN,
-                SwipeAction("Back", "↩", Color.White),
-            )
-        }
-        SwipeOnlyScreen(
-            title = "Route preview",
-            actions = actions,
-            onSwipe = { direction ->
-                when (direction) {
-                    SwipeDirection.LEFT,
-                    SwipeDirection.DOWN,
-                    -> onBack()
-                    SwipeDirection.RIGHT -> if (summary != null) onStart()
-                    SwipeDirection.UP -> if (summary?.steps?.isNotEmpty() == true) onReview()
-                    else -> Unit
-                }
-            },
-        ) {
-            Text(
-                place?.name ?: "Selected destination",
-                fontSize = 34.sp,
-                lineHeight = 42.sp,
-                fontWeight = FontWeight.Black,
-                textAlign = TextAlign.Center,
-            )
-            Spacer(Modifier.height(14.dp))
-            if (summary == null) {
-                Text(
-                    if (currentLocation == null) locationStatus else status,
-                    fontSize = 24.sp,
-                    lineHeight = 34.sp,
-                    textAlign = TextAlign.Center,
-                )
-            } else {
-                if (isSimulation) {
-                    Text(
-                        "SIMULATION ONLY",
-                        color = MaterialTheme.colorScheme.primary,
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.Black,
-                    )
-                }
-                Text(
-                    summary.mentalMapSummary,
-                    fontSize = 27.sp,
-                    lineHeight = 36.sp,
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center,
-                )
-                if (summary.steps.isNotEmpty()) {
-                    Text(
-                        "${summary.steps.size} walking steps. Swipe up to review every step.",
-                        fontSize = 22.sp,
-                        lineHeight = 30.sp,
-                        fontWeight = FontWeight.Bold,
-                        textAlign = TextAlign.Center,
-                    )
-                }
             }
         }
-        return
+        put(
+            SwipeDirection.DOWN,
+            SwipeAction(p.back, "↩", SemanticColors.Neutral),
+        )
     }
-
-    StandardScreen(
-        title = "Route preview",
-        onBack = onBack,
-        scrollable = true,
+    SwipeOnlyScreen(
+        title = p.routePreview,
+        actions = actions,
+        onSwipe = { direction ->
+            when (direction) {
+                SwipeDirection.LEFT,
+                SwipeDirection.DOWN,
+                -> onBack()
+                SwipeDirection.RIGHT -> if (summary != null) onStart()
+                SwipeDirection.UP -> if (summary?.steps?.isNotEmpty() == true) onReview()
+                else -> Unit
+            }
+        },
     ) {
         Text(
-            place?.name ?: "Selected destination",
-            fontSize = 32.sp,
-            lineHeight = 40.sp,
+            place?.name ?: p.selectedDestination,
+            fontSize = 34.sp,
+            lineHeight = 42.sp,
             fontWeight = FontWeight.Black,
+            textAlign = TextAlign.Center,
         )
+        Spacer(Modifier.height(14.dp))
         if (summary == null) {
             Text(
-                if (currentLocation == null) locationStatus else status,
+                p.statusText(if (currentLocation == null) locationStatus else status),
                 fontSize = 24.sp,
                 lineHeight = 34.sp,
+                textAlign = TextAlign.Center,
                 modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
             )
         } else {
-            if (isSimulation) {
+            if (isSimulation || isMovementSimulated) {
                 Text(
-                    "SIMULATION ONLY — this route does not represent real streets or distance.",
-                    color = MaterialTheme.colorScheme.primary,
+                    p.simulationOnly,
+                    color = SemanticColors.Optional,
                     fontSize = 22.sp,
-                    lineHeight = 30.sp,
                     fontWeight = FontWeight.Black,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth(),
                 )
             }
             Text(
-                "${summary.spokenDistance}, approximately ${summary.durationMinutes} minutes.",
-                fontSize = 28.sp,
-                lineHeight = 38.sp,
+                p.routeSummary(summary),
+                fontSize = 27.sp,
+                lineHeight = 36.sp,
                 fontWeight = FontWeight.Bold,
-                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                textAlign = TextAlign.Center,
             )
-            Text(
-                "The current app provides route guidance only. Future local backpack obstacle " +
-                    "warnings must have priority over route guidance.",
-                fontSize = 20.sp,
-                lineHeight = 29.sp,
-            )
+            weather?.let {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    p.weatherSummary(it),
+                    fontSize = 21.sp,
+                    lineHeight = 28.sp,
+                    textAlign = TextAlign.Center,
+                )
+            }
+            if (summary.steps.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    p.walkingStepsCount.format(summary.steps.size),
+                    fontSize = 22.sp,
+                    lineHeight = 30.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                )
+            }
         }
-        LargeAction(
-            label = "Start navigation",
-            supportingText = when {
-                summary == null -> "Waiting for route"
-                isSimulation -> "Begin software-only demonstration"
-                else -> "Begin walking guidance"
-            },
-            onClick = onStart,
-            enabled = summary != null,
-        )
     }
 }
 
 @Composable
 private fun RouteWalkthroughScreen(
+    p: Phrases,
     summary: RouteSummary?,
+    speechDetail: SpeechDetail,
     onAnnounce: (String) -> Unit,
     onBack: () -> Unit,
 ) {
@@ -1917,15 +2059,8 @@ private fun RouteWalkthroughScreen(
     LaunchedEffect(index, step) {
         if (step != null) {
             onAnnounce(
-                "Route step ${index + 1} of ${steps.size}. ${step.spokenInstruction}. " +
-                    when {
-                        steps.size == 1 -> "Swipe down to return to the route preview."
-                        index == 0 -> "Swipe right for the next step or down to return."
-                        index == steps.lastIndex ->
-                            "Swipe left for the previous step or down to return."
-                        else -> "Swipe right for the next step, left for the previous step, " +
-                            "or down to return."
-                    },
+                p.stepXofY.format(index + 1, steps.size) + ". " +
+                    p.stepInstruction(step) + ".",
             )
         }
     }
@@ -1934,24 +2069,27 @@ private fun RouteWalkthroughScreen(
         if (index > 0) {
             put(
                 SwipeDirection.LEFT,
-                SwipeAction("Previous", "←", Color.White),
+                SwipeAction(p.previous, "←", SemanticColors.Neutral),
             )
         }
         if (index < steps.lastIndex) {
             put(
                 SwipeDirection.RIGHT,
-                SwipeAction("Next", "→", MaterialTheme.colorScheme.primary),
+                SwipeAction(p.next, "→", SemanticColors.Confirm),
             )
         }
         put(
             SwipeDirection.DOWN,
-            SwipeAction("Route preview", "↩", Color.White),
+            SwipeAction(p.routePreview, "↩", SemanticColors.Neutral),
         )
     }
 
     SwipeOnlyScreen(
-        title = if (step == null) "Route walkthrough unavailable" else
-            "Step ${index + 1} of ${steps.size}",
+        title = if (step == null) {
+            p.routeWalkthroughUnavailable
+        } else {
+            p.stepXofY.format(index + 1, steps.size)
+        },
         actions = actions,
         onSwipe = { direction ->
             when (direction) {
@@ -1963,7 +2101,7 @@ private fun RouteWalkthroughScreen(
         },
     ) {
         Text(
-            step?.spokenInstruction ?: "AMap did not provide route steps for this route.",
+            step?.let(p::stepInstruction) ?: p.noRouteSteps,
             fontSize = 32.sp,
             lineHeight = 42.sp,
             fontWeight = FontWeight.Black,
@@ -1973,9 +2111,8 @@ private fun RouteWalkthroughScreen(
         if (step?.maneuver == Maneuver.CROSSWALK) {
             Spacer(Modifier.height(12.dp))
             Text(
-                "Mapped crossing: confirm the real crossing and traffic state before entering. " +
-                    "The current app cannot verify that it is safe to cross.",
-                color = MaterialTheme.colorScheme.primary,
+                p.crossingWarning,
+                color = SemanticColors.Optional,
                 fontSize = 22.sp,
                 lineHeight = 30.sp,
                 fontWeight = FontWeight.Bold,
@@ -1985,8 +2122,8 @@ private fun RouteWalkthroughScreen(
         if (step?.needsEnvironmentalConfirmation == true && step.maneuver != Maneuver.CROSSWALK) {
             Spacer(Modifier.height(12.dp))
             Text(
-                "Mapped feature: confirm the real surroundings before continuing.",
-                color = MaterialTheme.colorScheme.primary,
+                p.mappedFeatureWarning,
+                color = SemanticColors.Optional,
                 fontSize = 22.sp,
                 lineHeight = 30.sp,
                 fontWeight = FontWeight.Bold,
@@ -1998,18 +2135,25 @@ private fun RouteWalkthroughScreen(
 
 @Composable
 private fun ActiveNavigationScreen(
+    p: Phrases,
+    guidancePhrases: GuidancePhrases,
+    speechDetail: SpeechDetail,
     instruction: NavigationInstruction?,
     navigationStatus: String,
     wearableStatus: String,
     routeSummary: RouteSummary?,
     naviView: AMapNaviView,
+    onAnnounce: (String) -> Unit,
     onRepeat: () -> Unit,
     onPause: () -> Unit,
 ) {
     NativeNavigationMap(
+        p = p,
+        guidancePhrases = guidancePhrases,
+        speechDetail = speechDetail,
         instruction = instruction,
-        navigationStatus = navigationStatus,
-        wearableStatus = wearableStatus,
+        navigationStatus = p.statusText(navigationStatus),
+        wearableStatus = p.statusText(wearableStatus),
         routeSummary = routeSummary,
         naviView = naviView,
         isPaused = false,
@@ -2020,15 +2164,19 @@ private fun ActiveNavigationScreen(
 
 @Composable
 private fun PausedScreen(
+    p: Phrases,
     instruction: NavigationInstruction?,
     naviView: AMapNaviView,
     onContinue: () -> Unit,
     onEnd: () -> Unit,
 ) {
     NativeNavigationMap(
+        p = p,
+        guidancePhrases = null,
+        speechDetail = SpeechDetail.STANDARD,
         instruction = instruction,
-        navigationStatus = "Guidance paused",
-        wearableStatus = "The current app does not verify nearby obstacles",
+        navigationStatus = p.guidancePaused,
+        wearableStatus = p.obstacleNotVerifiedNote,
         routeSummary = null,
         naviView = naviView,
         isPaused = true,
@@ -2039,6 +2187,9 @@ private fun PausedScreen(
 
 @Composable
 private fun NativeNavigationMap(
+    p: Phrases,
+    guidancePhrases: GuidancePhrases?,
+    speechDetail: SpeechDetail,
     instruction: NavigationInstruction?,
     navigationStatus: String,
     wearableStatus: String,
@@ -2057,16 +2208,25 @@ private fun NativeNavigationMap(
         }
     }
 
+    // The same precise sentence the user hears, shown in large type for anyone with
+    // usable residual vision. AMap's own banner stays visible underneath it.
+    val cueText = instruction?.cue?.let { cue ->
+        guidancePhrases?.cueMessage(cue, speechDetail, p)
+    } ?: instruction?.let(p::instructionMessage)
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .semantics {
-                paneTitle = if (isPaused) "Navigation paused" else "Active AMap navigation"
+                paneTitle = if (isPaused) p.navigationPausedTitle else p.activeNavigationTitle
                 contentDescription = buildString {
-                    append(instruction?.message ?: "Waiting for first instruction")
+                    append(cueText ?: p.waitingFirstInstruction)
                     append(". ")
                     routeSummary?.let {
-                        append("${it.spokenDistance}, ${it.durationMinutes} minutes. ")
+                        append(p.distancePhrase(it.distanceMeters))
+                        append(", ")
+                        append(p.minutesAbout.format(it.durationMinutes))
+                        append(". ")
                     }
                     append(navigationStatus)
                     append(". ")
@@ -2078,6 +2238,32 @@ private fun NativeNavigationMap(
             factory = { naviView },
             modifier = Modifier.fillMaxSize(),
         )
+
+        if (cueText != null) {
+            val isUrgent = instruction?.cue?.stage == CueStage.ACT ||
+                instruction?.cue?.stage == CueStage.OFF_ROUTE
+            Surface(
+                color = if (isUrgent) SemanticColors.Optional else Color.Black.copy(alpha = 0.9f),
+                contentColor = if (isUrgent) SemanticColors.OnLight else SemanticColors.OnDark,
+                shape = RoundedCornerShape(22.dp),
+                shadowElevation = 12.dp,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(start = 12.dp, end = 12.dp, bottom = 104.dp)
+                    .fillMaxWidth(),
+            ) {
+                Text(
+                    cueText,
+                    style = labelStyle(26, FontWeight.Bold),
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .padding(horizontal = 16.dp, vertical = 14.dp)
+                        .fillMaxWidth()
+                        .semantics { liveRegion = LiveRegionMode.Polite },
+                )
+            }
+        }
 
         Row(
             modifier = Modifier
@@ -2095,7 +2281,7 @@ private fun NativeNavigationMap(
                     .height(72.dp),
             ) {
                 Text(
-                    if (isPaused) "▶ Continue" else "↻ Repeat",
+                    if (isPaused) p.continueAction else p.repeat,
                     fontSize = 22.sp,
                     fontWeight = FontWeight.Black,
                 )
@@ -2103,7 +2289,11 @@ private fun NativeNavigationMap(
             Button(
                 onClick = onSecondary,
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isPaused) Color(0xFFD32F2F) else Color.Black.copy(alpha = 0.88f),
+                    containerColor = if (isPaused) {
+                        Color(0xFFD32F2F)
+                    } else {
+                        Color.Black.copy(alpha = 0.88f)
+                    },
                     contentColor = Color.White,
                 ),
                 elevation = ButtonDefaults.buttonElevation(defaultElevation = 10.dp),
@@ -2112,7 +2302,7 @@ private fun NativeNavigationMap(
                     .height(72.dp),
             ) {
                 Text(
-                    if (isPaused) "■ End" else "Ⅱ Pause",
+                    if (isPaused) p.end else p.pause,
                     fontSize = 22.sp,
                     fontWeight = FontWeight.Black,
                 )
@@ -2156,80 +2346,66 @@ private fun rememberNativeAmapNavigationView(): AMapNaviView {
 
 @Composable
 private fun ArrivalScreen(
+    p: Phrases,
     place: PlaceCandidate?,
-    useDirectionalLayout: Boolean,
     onFinish: () -> Unit,
 ) {
-    if (useDirectionalLayout) {
-        SwipeOnlyScreen(
-            title = "Destination reached",
-            actions = mapOf(
-                SwipeDirection.RIGHT to SwipeAction(
-                    label = "Finish",
-                    symbol = "✓",
-                    color = MaterialTheme.colorScheme.primary,
-                ),
-                SwipeDirection.DOWN to SwipeAction(
-                    label = "Back to home",
-                    symbol = "↩",
-                    color = Color.White,
-                ),
+    SwipeOnlyScreen(
+        title = p.destinationReached,
+        actions = mapOf(
+            SwipeDirection.RIGHT to SwipeAction(
+                label = p.finish,
+                symbol = "✓",
+                color = SemanticColors.Confirm,
             ),
-            onSwipe = { direction ->
-                if (direction == SwipeDirection.RIGHT || direction == SwipeDirection.DOWN) {
-                    onFinish()
-                }
-            },
-        ) {
-            Text(
-                "Arrived at ${place?.name ?: "destination"}",
-                fontSize = 38.sp,
-                lineHeight = 46.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center,
-            )
-        }
-        return
-    }
-
-    StandardScreen(
-        title = "Destination reached",
-        onBack = onFinish,
+            SwipeDirection.DOWN to SwipeAction(
+                label = p.backToHome,
+                symbol = "↩",
+                color = SemanticColors.Neutral,
+            ),
+        ),
+        onSwipe = { direction ->
+            if (direction == SwipeDirection.RIGHT || direction == SwipeDirection.DOWN) {
+                onFinish()
+            }
+        },
     ) {
         Text(
-            "You have arrived near ${place?.name ?: "the destination"}. Confirm the exact entrance using your mobility aid and the backpack.",
-            fontSize = 30.sp,
-            lineHeight = 42.sp,
+            p.arrivedAt.format(place?.name ?: p.selectedDestination),
+            fontSize = 38.sp,
+            lineHeight = 46.sp,
             fontWeight = FontWeight.Bold,
-            modifier = Modifier
-                .weight(1f)
-                .semantics {
-                    liveRegion = LiveRegionMode.Assertive
-                },
+            textAlign = TextAlign.Center,
         )
-        LargeAction(
-            "Finish navigation",
-            onClick = onFinish,
+        Spacer(Modifier.height(12.dp))
+        Text(
+            p.confirmEntranceNote,
+            color = SemanticColors.Optional,
+            fontSize = 22.sp,
+            lineHeight = 30.sp,
+            fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center,
         )
     }
 }
 
 @Composable
 private fun SettingsScreen(
+    p: Phrases,
     onBack: () -> Unit,
     onDeviceSettings: () -> Unit,
     onAppSettings: () -> Unit,
 ) {
-    StandardScreen("Settings", onBack) {
+    StandardScreen(p.settings, p.back, onBack) {
         LargeAction(
-            label = "Device settings",
-            supportingText = "Connection, vibration, speakers and signal tests",
+            label = p.deviceSettings,
+            supportingText = p.deviceSettingsSupport,
             onClick = onDeviceSettings,
             modifier = Modifier.weight(1f),
         )
         LargeAction(
-            label = "App settings",
-            supportingText = "Language, speech, history and developer tools",
+            label = p.appSettings,
+            supportingText = p.appSettingsSupport,
             onClick = onAppSettings,
             modifier = Modifier.weight(1f),
         )
@@ -2238,6 +2414,8 @@ private fun SettingsScreen(
 
 @Composable
 private fun DeviceSettingsScreen(
+    p: Phrases,
+    guidancePhrases: GuidancePhrases,
     wearableStatus: String,
     deviceCommandStatus: String,
     preferences: UserPreferences,
@@ -2249,8 +2427,8 @@ private fun DeviceSettingsScreen(
     onSave: (UserPreferences) -> Unit,
     onTestCommand: (DeviceTestCommand) -> Unit,
 ) {
-    StandardScreen("Device settings", onBack, scrollable = true) {
-        SettingHeading("Connection")
+    StandardScreen(p.deviceSettings, p.back, onBack, scrollable = true) {
+        SettingHeading(p.connection)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -2258,7 +2436,7 @@ private fun DeviceSettingsScreen(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    "Use simulated system",
+                    p.useSimulatedSystem,
                     fontSize = 23.sp,
                     lineHeight = 30.sp,
                     fontWeight = FontWeight.Bold,
@@ -2266,8 +2444,7 @@ private fun DeviceSettingsScreen(
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Text(
-                    "Runs the upper controller, ESP32, speakers and vibration outputs " +
-                        "without physical hardware.",
+                    p.useSimulatedSystemSupport,
                     fontSize = 19.sp,
                     lineHeight = 27.sp,
                     textAlign = TextAlign.Center,
@@ -2278,13 +2455,13 @@ private fun DeviceSettingsScreen(
                 checked = useMockHardware,
                 onCheckedChange = onSetMockHardware,
                 modifier = Modifier.semantics {
-                    contentDescription = "Use simulated system"
-                    stateDescription = if (useMockHardware) "On" else "Off"
+                    contentDescription = p.useSimulatedSystem
+                    stateDescription = if (useMockHardware) p.on else p.off
                 },
             )
         }
         Text(
-            wearableStatus,
+            p.statusText(wearableStatus),
             fontSize = 21.sp,
             lineHeight = 29.sp,
             textAlign = TextAlign.Center,
@@ -2293,15 +2470,15 @@ private fun DeviceSettingsScreen(
                 .semantics { liveRegion = LiveRegionMode.Polite },
         )
         LargeAction(
-            if (useMockHardware) "Start simulator" else "Connect device",
+            if (useMockHardware) p.startSimulator else p.connectDevice,
             onClick = onConnect,
         )
         LargeOutlinedAction(
-            if (useMockHardware) "Stop simulator" else "Disconnect device",
+            if (useMockHardware) p.stopSimulator else p.disconnectDevice,
             onClick = onDisconnect,
         )
         Text(
-            "Last output: $deviceCommandStatus",
+            p.lastOutputPrefix.format(p.statusText(deviceCommandStatus)),
             fontSize = 20.sp,
             lineHeight = 28.sp,
             textAlign = TextAlign.Center,
@@ -2310,19 +2487,61 @@ private fun DeviceSettingsScreen(
                 .semantics { liveRegion = LiveRegionMode.Polite },
         )
 
-        SettingHeading("Guidance feedback")
+        SettingHeading(p.guidanceFeedback)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    guidancePhrases.detailedGuidanceSetting,
+                    fontSize = 23.sp,
+                    lineHeight = 30.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    guidancePhrases.detailedGuidanceSettingSupport,
+                    fontSize = 19.sp,
+                    lineHeight = 27.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            Switch(
+                checked = preferences.detailedPedestrianGuidance,
+                onCheckedChange = {
+                    onSave(preferences.copy(detailedPedestrianGuidance = it))
+                },
+                modifier = Modifier.semantics {
+                    contentDescription = guidancePhrases.detailedGuidanceSetting
+                    stateDescription = if (preferences.detailedPedestrianGuidance) p.on else p.off
+                },
+            )
+        }
         GuidanceMode.entries.forEach { mode ->
             SelectionAction(
-                label = mode.displayName,
+                label = when (mode) {
+                    GuidanceMode.HAPTIC_AND_SPEECH -> p.guidanceModeHapticSpeech
+                    GuidanceMode.HAPTIC_ONLY -> p.guidanceModeHapticOnly
+                    GuidanceMode.SPEECH_ONLY -> p.guidanceModeSpeechOnly
+                },
                 selected = preferences.guidanceMode == mode,
+                selectedPrefixTemplate = p.selectedPrefix,
+                selectedStateLabel = p.selected,
+                notSelectedStateLabel = p.notSelected,
             ) {
                 onSave(preferences.copy(guidanceMode = mode))
             }
         }
 
-        SettingHeading("Vibration strength")
+        SettingHeading(p.vibrationStrength)
         StepSetting(
-            value = "${preferences.vibrationStrength} percent",
+            value = p.percentValue.format(preferences.vibrationStrength),
+            decreaseLabel = p.decrease,
+            increaseLabel = p.increase,
             onDecrease = {
                 onSave(
                     preferences.copy(
@@ -2355,7 +2574,7 @@ private fun DeviceSettingsScreen(
                     .weight(1f)
                     .height(72.dp),
             ) {
-                Text("Test left")
+                Text(p.testLeft)
             }
             OutlinedButton(
                 onClick = {
@@ -2373,13 +2592,15 @@ private fun DeviceSettingsScreen(
                     .weight(1f)
                     .height(72.dp),
             ) {
-                Text("Test right")
+                Text(p.testRight)
             }
         }
 
-        SettingHeading("Speaker volume")
+        SettingHeading(p.speakerVolume)
         StepSetting(
-            value = "${preferences.speakerVolume} percent",
+            value = p.percentValue.format(preferences.speakerVolume),
+            decreaseLabel = p.decrease,
+            increaseLabel = p.increase,
             onDecrease = {
                 onSave(
                     preferences.copy(
@@ -2396,23 +2617,22 @@ private fun DeviceSettingsScreen(
             },
         )
         LargeOutlinedAction(
-            label = "Test both speakers",
+            label = p.testBothSpeakers,
             onClick = {
-            onTestCommand(
-                DeviceTestCommand.Audio(
-                    side = OutputSide.BOTH,
-                    cue = AudioCue.TEST_TONE,
-                    volumePercent = preferences.speakerVolume,
-                    repeatCount = 1,
-                ),
-            )
+                onTestCommand(
+                    DeviceTestCommand.Audio(
+                        side = OutputSide.BOTH,
+                        cue = AudioCue.TEST_TONE,
+                        volumePercent = preferences.speakerVolume,
+                        repeatCount = 1,
+                    ),
+                )
             },
         )
 
         Text(
-            "When the device is integrated, immediate local obstacle detection must not be " +
-                "disabled here and must always override navigation guidance.",
-            color = MaterialTheme.colorScheme.primary,
+            p.safetyOverrideNote,
+            color = SemanticColors.Optional,
             fontSize = 20.sp,
             lineHeight = 29.sp,
             fontWeight = FontWeight.Bold,
@@ -2422,6 +2642,7 @@ private fun DeviceSettingsScreen(
 
 @Composable
 private fun AppSettingsScreen(
+    p: Phrases,
     preferences: UserPreferences,
     recentCount: Int,
     onBack: () -> Unit,
@@ -2429,28 +2650,38 @@ private fun AppSettingsScreen(
     onClearHistory: () -> Unit,
     onOpenEngineering: () -> Unit,
 ) {
-    StandardScreen("App settings", onBack, scrollable = true) {
-        SettingHeading("Voice recognition language")
+    StandardScreen(p.appSettings, p.back, onBack, scrollable = true) {
+        SettingHeading(p.voiceRecognitionLanguage)
         AppLanguage.entries.forEach { language ->
             SelectionAction(
                 label = language.displayName,
                 selected = preferences.language == language,
+                selectedPrefixTemplate = p.selectedPrefix,
+                selectedStateLabel = p.selected,
+                notSelectedStateLabel = p.notSelected,
             ) {
                 onSave(preferences.copy(language = language))
             }
         }
 
-        SettingHeading("Navigation speech detail")
+        SettingHeading(p.navigationSpeechDetail)
         SpeechDetail.entries.forEach { detail ->
             SelectionAction(
-                label = detail.displayName,
+                label = when (detail) {
+                    SpeechDetail.CONCISE -> p.speechDetailConcise
+                    SpeechDetail.STANDARD -> p.speechDetailStandard
+                    SpeechDetail.DETAILED -> p.speechDetailDetailed
+                },
                 selected = preferences.speechDetail == detail,
+                selectedPrefixTemplate = p.selectedPrefix,
+                selectedStateLabel = p.selected,
+                notSelectedStateLabel = p.notSelected,
             ) {
                 onSave(preferences.copy(speechDetail = detail))
             }
         }
 
-        SettingHeading("Screen narration")
+        SettingHeading(p.screenNarration)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -2458,7 +2689,7 @@ private fun AppSettingsScreen(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    "Announce each screen",
+                    p.announceEachScreen,
                     fontSize = 23.sp,
                     lineHeight = 30.sp,
                     fontWeight = FontWeight.Bold,
@@ -2466,8 +2697,7 @@ private fun AppSettingsScreen(
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Text(
-                    "Speaks the screen title, button names and their positions. " +
-                        "Automatically stays silent while TalkBack touch exploration is active.",
+                    p.announceEachScreenSupport,
                     fontSize = 19.sp,
                     lineHeight = 27.sp,
                     textAlign = TextAlign.Center,
@@ -2480,488 +2710,72 @@ private fun AppSettingsScreen(
                     onSave(preferences.copy(extraSpokenPrompts = it))
                 },
                 modifier = Modifier.semantics {
-                    contentDescription = "Announce each screen"
-                    stateDescription = if (preferences.extraSpokenPrompts) "On" else "Off"
+                    contentDescription = p.announceEachScreen
+                    stateDescription = if (preferences.extraSpokenPrompts) p.on else p.off
                 },
             )
         }
 
-        SettingHeading("Destination history")
-        Text("$recentCount recent places saved", fontSize = 20.sp)
-        LargeOutlinedAction("Delete destination history", onClick = onClearHistory)
+        SettingHeading(p.destinationHistory)
+        Text(p.recentPlacesSaved.format(recentCount), fontSize = 20.sp)
+        LargeOutlinedAction(p.deleteDestinationHistory, onClick = onClearHistory)
 
-        SettingHeading("Developer tools")
+        SettingHeading(p.developerTools)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    p.simulateMovementSetting,
+                    fontSize = 23.sp,
+                    lineHeight = 30.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    p.simulateMovementSettingSupport,
+                    fontSize = 19.sp,
+                    lineHeight = 27.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            Switch(
+                checked = preferences.simulateNavigationMovement,
+                onCheckedChange = {
+                    onSave(preferences.copy(simulateNavigationMovement = it))
+                },
+                modifier = Modifier.semantics {
+                    contentDescription = p.simulateMovementSetting
+                    stateDescription = if (preferences.simulateNavigationMovement) p.on else p.off
+                },
+            )
+        }
         Text(
-            "The engineering console is not intended for blind-user operation.",
+            p.engineeringConsoleNote,
             fontSize = 18.sp,
             lineHeight = 26.sp,
         )
-        LargeOutlinedAction("Open engineering console", onClick = onOpenEngineering)
+        LargeOutlinedAction(p.openEngineeringConsole, onClick = onOpenEngineering)
     }
 }
 
-@Composable
-private fun StandardScreen(
-    title: String,
-    onBack: () -> Unit,
-    scrollable: Boolean = false,
-    content: @Composable ColumnScope.() -> Unit,
-) {
-    val contentModifier = if (scrollable) {
-        Modifier.verticalScroll(rememberScrollState())
-    } else {
-        Modifier
-    }
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .statusBarsPadding()
-            .navigationBarsPadding()
-            .then(contentModifier)
-            .padding(16.dp)
-            .semantics { paneTitle = title },
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
-        OutlinedButton(
-            onClick = onBack,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(64.dp),
-        ) {
-            Text(
-                "Back",
-                fontSize = 26.sp,
-                lineHeight = 32.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        }
-        Text(
-            title,
-            fontSize = 42.sp,
-            lineHeight = 50.sp,
-            fontWeight = FontWeight.Black,
-            textAlign = TextAlign.Center,
-            modifier = Modifier
-                .fillMaxWidth()
-                .semantics { heading() },
-        )
-        content()
-    }
-}
-
-@Composable
-private fun HomeButton(
-    label: String,
-    supportingText: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Button(
-        onClick = onClick,
-        colors = ButtonDefaults.buttonColors(
-            containerColor = MaterialTheme.colorScheme.primary,
-            contentColor = MaterialTheme.colorScheme.onPrimary,
-        ),
-        modifier = modifier.fillMaxWidth(),
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Text(
-                label,
-                fontSize = 48.sp,
-                lineHeight = 56.sp,
-                fontWeight = FontWeight.Black,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Text(
-                supportingText,
-                fontSize = 24.sp,
-                lineHeight = 32.sp,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        }
-    }
-}
-
-@Composable
-private fun LargeAction(
-    label: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    supportingText: String? = null,
-    enabled: Boolean = true,
-    destructive: Boolean = false,
-    stateDescription: String? = null,
-    live: Boolean = false,
-) {
-    Button(
-        onClick = onClick,
-        enabled = enabled,
-        colors = if (destructive) {
-            ButtonDefaults.buttonColors(
-                containerColor = Color(0xFFB3261E),
-                contentColor = Color.White,
-            )
-        } else {
-            ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
-            )
-        },
-        modifier = modifier
-            .fillMaxWidth()
-            .heightIn(min = 128.dp)
-            .then(
-                if (stateDescription != null || live) {
-                    Modifier.semantics {
-                        stateDescription?.let { this.stateDescription = it }
-                        if (live) liveRegion = LiveRegionMode.Assertive
-                    }
-                } else {
-                    Modifier
-                },
-            ),
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(9.dp),
-        ) {
-            Text(
-                label,
-                fontSize = 32.sp,
-                lineHeight = 40.sp,
-                fontWeight = FontWeight.Black,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            supportingText?.let {
-                Text(
-                    it,
-                    fontSize = 21.sp,
-                    lineHeight = 29.sp,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun LargeOutlinedAction(
-    label: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    supportingText: String? = null,
-) {
-    OutlinedButton(
-        onClick = onClick,
-        modifier = modifier
-            .fillMaxWidth()
-            .heightIn(min = 116.dp),
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(7.dp),
-        ) {
-            Text(
-                label,
-                fontSize = 28.sp,
-                lineHeight = 36.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            supportingText?.let {
-                Text(
-                    it,
-                    fontSize = 20.sp,
-                    lineHeight = 28.sp,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun SelectionAction(
-    label: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-) {
-    OutlinedButton(
-        onClick = onClick,
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(76.dp)
-            .semantics {
-                stateDescription = if (selected) "Selected" else "Not selected"
-            },
-    ) {
-        Text(
-            if (selected) "Selected: $label" else label,
-            fontSize = 23.sp,
-            lineHeight = 30.sp,
-            fontWeight = if (selected) FontWeight.Black else FontWeight.Bold,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.fillMaxWidth(),
-        )
-    }
-}
-
-@Composable
-private fun SettingHeading(text: String) {
-    Text(
-        text,
-        fontSize = 30.sp,
-        lineHeight = 38.sp,
-        fontWeight = FontWeight.Black,
-        color = MaterialTheme.colorScheme.primary,
-        textAlign = TextAlign.Center,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 14.dp)
-            .semantics { heading() },
-    )
-}
-
-@Composable
-private fun StepSetting(
-    value: String,
-    onDecrease: () -> Unit,
-    onIncrease: () -> Unit,
-) {
-    Text(
-        value,
-        fontSize = 27.sp,
-        lineHeight = 34.sp,
-        fontWeight = FontWeight.Bold,
-        textAlign = TextAlign.Center,
-        modifier = Modifier
-            .fillMaxWidth()
-            .semantics { liveRegion = LiveRegionMode.Polite },
-    )
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        OutlinedButton(
-            onClick = onDecrease,
-            modifier = Modifier
-                .weight(1f)
-                .height(72.dp),
-        ) {
-            Text("Decrease", fontSize = 18.sp)
-        }
-        OutlinedButton(
-            onClick = onIncrease,
-            modifier = Modifier
-                .weight(1f)
-                .height(72.dp),
-        ) {
-            Text("Increase", fontSize = 18.sp)
-        }
-    }
-}
-
-private fun ProductionScreen.spokenIntroduction(
-    place: PlaceCandidate?,
-    routeSummary: RouteSummary?,
-    isSimulation: Boolean,
-    useDirectionalLayout: Boolean,
-): String = when (this) {
-    ProductionScreen.HOME ->
-        if (useDirectionalLayout) {
-            "Home. Swipe right for Navigation or left for Settings."
-        } else {
-            "Home screen. Navigation is the top half of the screen. Settings is the bottom half."
-        }
-
-    ProductionScreen.DESTINATION ->
-        if (useDirectionalLayout) {
-            "Choose destination. Swipe right for a new destination, left for recent and saved " +
-                "destinations, or down to go back."
-        } else if (isSimulation) {
-            "Choose destination. Start navigation demo is the first large button and needs no " +
-                "GPS or search. Speak, recent and typed destinations are below it."
-        } else {
-            "Choose destination. Back is at the top. Speak destination is the large upper button. " +
-                "Recent destinations is in the middle. Type destination is at the bottom."
-        }
-
-    ProductionScreen.DESTINATION_METHODS ->
-        "New destination. Swipe right for voice destination, left to search AMap or point on " +
-            "the map, or down to go back."
-
-    ProductionScreen.DESTINATION_COLLECTIONS ->
-        "Recent and saved destinations. Swipe right for saved destinations, left for recent " +
-            "destinations, or down to go back."
-
-    ProductionScreen.VOICE_DESTINATION ->
-        "Voice destination. Tap the large microphone to start listening. Swipe down to go back."
-
-    ProductionScreen.TYPE_DESTINATION ->
-        if (useDirectionalLayout) {
-            "Type destination helper mode. Enter a place, then swipe right to search. " +
-                "Swipe left to clear or down to go back."
-        } else {
-            "Type destination. Back is at the top. The destination text field is in the middle. " +
-                "Search for this place is below it."
-        }
-
-    ProductionScreen.MAP_DESTINATION ->
-        "AMap destination search. Type a place and choose an AMap suggestion, or tap the " +
-            "full-screen map to place a marker. Floating controls are at the bottom."
-
-    ProductionScreen.RECENT_PLACES ->
-        if (useDirectionalLayout) {
-            "Recent destinations. Swipe right to use the current place, left for the next place, " +
-                "or down to go back."
-        } else {
-            "Recent destinations. Back is at the top. Saved destinations are listed from top to bottom."
-        }
-
-    ProductionScreen.SEARCHING ->
-        if (useDirectionalLayout) {
-            "Destination search. Search status is in the center. Swipe down to go back."
-        } else {
-            "Destination search. Back is at the top. Search status is in the center."
-        }
-
-    ProductionScreen.SEARCH_RESULTS ->
-        if (useDirectionalLayout) {
-            "Choose the correct place. One result is shown and announced at a time."
-        } else {
-            "Choose the correct place. Back is at the top. Search results are arranged from top to bottom."
-        }
-
-    ProductionScreen.CONFIRM_PLACE ->
-        if (useDirectionalLayout) {
-            "Confirm destination ${place?.spokenDescription ?: ""}. " +
-                "Swipe right to confirm, left to decline, " +
-                "or down to go back."
-        } else {
-            "Confirm destination ${place?.name ?: ""}. " +
-                "Yes, use this place is above Choose another place."
-        }
-
-    ProductionScreen.ROUTE_OPTIONS -> routeSummary?.let {
-        "Choose a walking route. ${it.mentalMapSummary}. " +
-            "Swipe right to choose the current route, left for another route when available, " +
-            "or down to go back."
-    } ?: "AMap is preparing walking route choices. Swipe down to go back."
-
-    ProductionScreen.ROUTE_PREVIEW -> routeSummary?.let {
-        val mode = if (isSimulation) {
-            "Simulation only. This is not a real route. "
-        } else {
-            ""
-        }
-        mode + "Route preview for ${place?.name ?: "the selected destination"}. " +
-            "${it.mentalMapSummary}. " +
-            if (useDirectionalLayout) {
-                if (it.steps.isNotEmpty()) {
-                    "Swipe up to review all ${it.steps.size} walking steps, right to start, " +
-                        "left to decline, or down to go back."
-                } else {
-                    "Swipe right to start, left to decline, or down to go back."
-                }
-            } else {
-                "Start navigation is at the bottom."
-            }
-    } ?: if (useDirectionalLayout) {
-        "Route preview. The route is being prepared. Swipe down to go back."
-    } else {
-        "Route preview. The route is being prepared. Back is at the top. " +
-            "Start navigation will become available at the bottom."
-    }
-
-    ProductionScreen.ROUTE_WALKTHROUGH ->
-        "Route walkthrough. Each AMap walking step is announced individually."
-
-    ProductionScreen.ACTIVE_NAVIGATION ->
-        "Active navigation. The native AMap guidance map fills the screen. " +
-            "Repeat and Pause controls float at the bottom."
-
-    ProductionScreen.PAUSED ->
-        "Navigation paused. The AMap route remains visible. Continue and End controls float at the bottom."
-
-    ProductionScreen.ARRIVED ->
-        if (useDirectionalLayout) {
-            "Destination reached near ${place?.name ?: "the destination"}. " +
-                "Swipe right to finish or down to return home."
-        } else {
-            "Destination reached near ${place?.name ?: "the destination"}. " +
-                "Finish navigation is at the bottom."
-        }
-
-    ProductionScreen.SETTINGS ->
-        "Settings. Back is at the top. Device settings is the upper button. " +
-            "App settings is the lower button."
-
-    ProductionScreen.DEVICE_SETTINGS ->
-        "Device settings. Back is at the top. Scroll down for connection, guidance, vibration, " +
-            "speaker and safety controls."
-
-    ProductionScreen.APP_SETTINGS ->
-        "App settings. Back is at the top. Scroll down for recognition language, speech detail, " +
-            "screen introductions, history and developer tools."
-
-    ProductionScreen.ENGINEERING ->
-        "Engineering test console. This screen is intended for development and hardware testing."
-}
-
-private val SimulatedDestination = PlaceCandidate(
-    id = "simulated-destination",
-    name = "Simulated destination",
-    address = "Software-only navigation demonstration",
-    area = "Changsha",
-    latitude = 28.2310,
-    longitude = 112.9440,
-)
-
-private fun distanceMeters(
-    startLatitude: Double,
-    startLongitude: Double,
-    endLatitude: Double,
-    endLongitude: Double,
-): Int {
-    val latitudeDelta = Math.toRadians(endLatitude - startLatitude)
-    val longitudeDelta = Math.toRadians(endLongitude - startLongitude)
-    val startLatitudeRadians = Math.toRadians(startLatitude)
-    val endLatitudeRadians = Math.toRadians(endLatitude)
-    val a = sin(latitudeDelta / 2) * sin(latitudeDelta / 2) +
-        cos(startLatitudeRadians) * cos(endLatitudeRadians) *
-        sin(longitudeDelta / 2) * sin(longitudeDelta / 2)
-    val angularDistance = 2 * atan2(sqrt(a), sqrt(1 - a))
-    return (6_371_000 * angularDistance).toInt().coerceAtLeast(0)
-}
-
-private fun formatDistance(metres: Int): String = if (metres >= 1_000) {
-    "%.1f kilometres away".format(metres / 1_000.0)
-} else {
-    "$metres metres away"
-}
-
-private fun ProductionScreen.backDestination(): ProductionScreen = when (this) {
+internal fun ProductionScreen.backDestination(): ProductionScreen = when (this) {
     ProductionScreen.HOME -> ProductionScreen.HOME
+    ProductionScreen.WHERE_AM_I -> ProductionScreen.HOME
     ProductionScreen.DESTINATION,
     ProductionScreen.SETTINGS,
     -> ProductionScreen.HOME
 
     ProductionScreen.DESTINATION_METHODS,
     ProductionScreen.DESTINATION_COLLECTIONS,
+    ProductionScreen.NEARBY_CATEGORIES,
     -> ProductionScreen.DESTINATION
 
+    ProductionScreen.NEARBY_RESULTS -> ProductionScreen.NEARBY_CATEGORIES
     ProductionScreen.VOICE_DESTINATION -> ProductionScreen.DESTINATION_METHODS
     ProductionScreen.TYPE_DESTINATION,
     ProductionScreen.RECENT_PLACES,
@@ -2969,6 +2783,7 @@ private fun ProductionScreen.backDestination(): ProductionScreen = when (this) {
     ProductionScreen.SEARCH_RESULTS,
     -> ProductionScreen.DESTINATION
 
+    ProductionScreen.SAVED_PLACES -> ProductionScreen.DESTINATION_COLLECTIONS
     ProductionScreen.MAP_DESTINATION -> ProductionScreen.DESTINATION_METHODS
     ProductionScreen.CONFIRM_PLACE -> ProductionScreen.DESTINATION
     ProductionScreen.ROUTE_OPTIONS -> ProductionScreen.CONFIRM_PLACE

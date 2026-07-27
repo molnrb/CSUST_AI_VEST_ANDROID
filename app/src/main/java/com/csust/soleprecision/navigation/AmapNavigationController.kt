@@ -20,15 +20,49 @@ class AmapNavigationController(
     private val onStatus: (String) -> Unit,
     private val onRouteReady: (RouteSummary) -> Unit = {},
     private val onRoutesReady: (List<RouteSummary>) -> Unit = {},
+    /**
+     * Resolves a short landmark name near a maneuver point so cues can say
+     * "turn right at <place>". Optional: guidance works without it.
+     */
+    private val landmarkResolver: ((Double, Double, (String) -> Unit) -> Unit)? = null,
 ) : AutoCloseable {
     private val appContext = context.applicationContext
     private var amapNavi: AMapNavi? = null
+    private val guidanceEngine = PedestrianGuidanceEngine()
+
+    @Volatile
+    private var activePathCoordinates: List<RouteCoordinate> = emptyList()
+
+    /** Landmark near the end of each step, filled in lazily as steps are reached. */
+    private val stepLandmarks = mutableMapOf<Int, String>()
+
+    @Volatile
+    private var landmarkRequestedForStep: Int = -1
+
+    @Volatile
+    private var lastCue: GuidanceCue? = null
+
+    // Written from AMap SDK callbacks and read while building instructions; volatile so
+    // a callback on a different thread never observes a stale route or step list.
+    @Volatile
     private var lastInstructionKey: String? = null
+
+    @Volatile
     private var pendingNaviType: Int = NaviType.GPS
+
+    @Volatile
     private var startWhenRouteReady = true
+
+    @Volatile
     private var activeWalkingSteps: List<WalkingRouteStep> = emptyList()
+
+    @Volatile
     private var availableRoutes: List<RouteSummary> = emptyList()
+
+    @Volatile
     private var latestNaviLocation: AMapNaviLocation? = null
+
+    @Volatile
     private var routeCompletionHandled = false
 
     @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
@@ -115,6 +149,7 @@ class AmapNavigationController(
         override fun onReCalculateRouteForYaw() {
             routeCompletionHandled = false
             lastInstructionKey = null
+            guidanceEngine.resetForNewRoute()
             onStatus("Off route; AMap is calculating new walking guidance")
         }
 
@@ -146,51 +181,69 @@ class AmapNavigationController(
                 ?.takeIf { it in activeWalkingSteps.indices }
                 ?: naviInfo.curStep
             val mappedStep = activeWalkingSteps.getOrNull(stepIndex)
+            val currentPoint = liveLocation?.coord?.let {
+                RouteCoordinate(it.latitude, it.longitude)
+            }
             val distance = if (
-                liveLocation?.coord != null &&
+                currentPoint != null &&
                 mappedStep?.coordinates?.size?.let { it >= 2 } == true
             ) {
                 RouteGeometry.remainingDistanceMeters(
-                    current = RouteCoordinate(
-                        liveLocation.coord.latitude,
-                        liveLocation.coord.longitude,
-                    ),
+                    current = currentPoint,
                     stepPoints = mappedStep.coordinates,
                 )
             } else {
                 mappedStep?.distanceMeters ?: 0
             }
-            val message = buildString {
-                append(maneuver.spokenLabel)
-                if (distance > 0) append(" in $distance metres")
-                if (road.isNotBlank()) append(" toward $road")
-                if (
-                    distance in 1..50 &&
-                    mappedStep?.mappedTrafficLightCount?.let { it > 0 } == true
-                ) {
-                    append(". AMap shows a traffic light on this step")
+            requestLandmarkForStep(stepIndex, mappedStep)
+
+            val nextStep = activeWalkingSteps.getOrNull(stepIndex + 1)
+            val relativeBearing = liveLocation
+                ?.bearing
+                ?.takeIf { it.isFinite() }
+                ?.let { heading ->
+                    val target = nextStep
+                        ?.coordinates
+                        ?.let(RouteGeometry::initialBearingDegrees)
+                    target?.let {
+                        RouteGeometry.relativeBearingDegrees(heading.toInt(), it)
+                    }
                 }
-                if (mappedStep?.needsEnvironmentalConfirmation == true) {
-                    append(". Confirm the real surroundings before continuing")
-                }
-                if (liveLocation?.isMatchNaviPath == false) {
-                    append(". Position is not matched to the mapped route")
-                }
+            val offRoute = if (
+                liveLocation?.isMatchNaviPath == false &&
+                currentPoint != null &&
+                activePathCoordinates.isNotEmpty()
+            ) {
+                RouteGeometry.distanceToPathMeters(currentPoint, activePathCoordinates)
+            } else {
+                null
             }
 
-            // AMap updates frequently. Only forward changes or a new 5 m distance bucket.
-            val key = "${maneuver.name}:${distance / 5}:$road"
-            if (key == lastInstructionKey) return
-            lastInstructionKey = key
-
-            onInstruction(
-                NavigationInstruction(
+            val cue = guidanceEngine.onSnapshot(
+                GuidanceSnapshot(
+                    stepIndex = stepIndex,
                     maneuver = maneuver,
-                    distanceMeters = distance,
-                    message = message,
-                    source = NavigationInstruction.Source.AMAP,
+                    distanceToManeuverMeters = distance,
+                    nextRoadName = road,
+                    currentRoadName = naviInfo.currentRoadName.orEmpty()
+                        .ifBlank { mappedStep?.roadName.orEmpty() },
+                    stepDistanceMeters = mappedStep?.distanceMeters ?: 0,
+                    orientation = nextStep?.orientation.orEmpty()
+                        .ifBlank { mappedStep?.orientation.orEmpty() },
+                    relativeBearingDegrees = relativeBearing,
+                    turnAngleDegrees = nextStep?.turnAngleDegrees,
+                    landmark = stepLandmarks[stepIndex].orEmpty(),
+                    trafficLightCount = mappedStep?.mappedTrafficLightCount ?: 0,
+                    needsConfirmation = mappedStep?.needsEnvironmentalConfirmation == true,
+                    remainingRouteMeters = naviInfo.pathRetainDistance,
+                    remainingRouteSeconds = naviInfo.pathRetainTime,
+                    offRouteMeters = offRoute,
                 ),
-            )
+            ) ?: return
+
+            lastCue = cue
+            lastInstructionKey = "${cue.stage}:${cue.maneuver}:${cue.distanceMeters}"
+            onInstruction(cue.toInstruction())
         }
 
         override fun onArriveDestination() {
@@ -212,12 +265,16 @@ class AmapNavigationController(
             // AMap requires both calls before any SDK API is used.
             NaviSetting.updatePrivacyShow(appContext, true, true)
             NaviSetting.updatePrivacyAgree(appContext, true)
-            amapNavi = AMapNavi.getInstance(appContext).also {
-                it.addAMapNaviListener(listener)
-                it.setUseInnerVoice(true, true)
-            }
+            val navi = AMapNavi.getInstance(appContext)
+            navi.setUseInnerVoice(true, true)
+            // Slowest supported walking emulation (10–30 km/h) for simulated navigation.
+            navi.setEmulatorNaviSpeed(EMULATOR_WALKING_SPEED_KMH)
+            // Attach the listener last so a partial initialization never leaks it.
+            navi.addAMapNaviListener(listener)
+            amapNavi = navi
             true
         } catch (error: Exception) {
+            amapNavi = null
             onStatus("AMap setup failed: ${error.message ?: "unknown error"}")
             false
         }
@@ -245,6 +302,7 @@ class AmapNavigationController(
         startLatitude: Double,
         startLongitude: Double,
         destination: PlaceCandidate,
+        simulateMovement: Boolean = false,
     ) {
         startWhenRouteReady = false
         requestWalkingRoute(
@@ -252,7 +310,7 @@ class AmapNavigationController(
             startLongitude = startLongitude,
             endLatitude = destination.latitude,
             endLongitude = destination.longitude,
-            simulateMovement = false,
+            simulateMovement = simulateMovement,
             destination = destination,
         )
     }
@@ -273,9 +331,14 @@ class AmapNavigationController(
 
         lastInstructionKey = null
         activeWalkingSteps = emptyList()
+        activePathCoordinates = emptyList()
         availableRoutes = emptyList()
         latestNaviLocation = null
         routeCompletionHandled = false
+        lastCue = null
+        stepLandmarks.clear()
+        landmarkRequestedForStep = -1
+        guidanceEngine.reset()
         pendingNaviType = if (simulateMovement) NaviType.EMULATOR else NaviType.GPS
         onStatus("Calculating walking route…")
         val accepted = if (destination != null) {
@@ -321,6 +384,7 @@ class AmapNavigationController(
         val route = availableRoutes.firstOrNull { it.routeId == routeId } ?: return false
         val accepted = routeId == 0 || amapNavi?.selectRouteId(routeId) == true
         if (accepted) {
+            lastInstructionKey = null
             activateRouteSummary(route)
             onStatus("Selected walking route ${availableRoutes.indexOf(route) + 1}")
         }
@@ -337,15 +401,44 @@ class AmapNavigationController(
     fun stop() {
         amapNavi?.stopNavi()
         activeWalkingSteps = emptyList()
+        activePathCoordinates = emptyList()
         availableRoutes = emptyList()
         latestNaviLocation = null
+        lastInstructionKey = null
+        lastCue = null
+        stepLandmarks.clear()
+        landmarkRequestedForStep = -1
+        guidanceEngine.reset()
         onStatus("Navigation stopped")
     }
 
     private fun activateRouteSummary(route: RouteSummary) {
         activeWalkingSteps = route.steps
+        activePathCoordinates = route.pathCoordinates
+        stepLandmarks.clear()
+        landmarkRequestedForStep = -1
+        guidanceEngine.resetForNewRoute()
         onRouteReady(route)
     }
+
+    /**
+     * Asks for a landmark near the end of the current step once, so the prepare
+     * and act cues can anchor the maneuver to something the user can perceive.
+     */
+    private fun requestLandmarkForStep(stepIndex: Int, step: WalkingRouteStep?) {
+        val resolver = landmarkResolver ?: return
+        if (landmarkRequestedForStep == stepIndex || stepLandmarks.containsKey(stepIndex)) return
+        val maneuverPoint = step?.coordinates?.lastOrNull() ?: return
+        landmarkRequestedForStep = stepIndex
+        resolver(maneuverPoint.latitude, maneuverPoint.longitude) { landmark ->
+            if (landmark.isNotBlank()) {
+                stepLandmarks[stepIndex] = landmark
+            }
+        }
+    }
+
+    /** Re-emits the most recent cue so the user can ask "say that again". */
+    fun repeatCurrentCue(): NavigationInstruction? = lastCue?.toInstruction()
 
     private fun AMapNaviPath.toRouteSummary(routeId: Int): RouteSummary {
         val rawSteps = steps.orEmpty().map { step ->
@@ -400,5 +493,10 @@ class AmapNavigationController(
             AMapNavi.destroy()
         }
         amapNavi = null
+    }
+
+    private companion object {
+        // AMap walking emulation accepts 10–30 km/h; 10 is closest to a real walking pace.
+        const val EMULATOR_WALKING_SPEED_KMH = 10
     }
 }
